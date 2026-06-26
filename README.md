@@ -24,8 +24,6 @@
 - pasting the text in the katb.in website.
 
 
-Note: This Bot is made on top of this repository -> https://github.com/sanjit-sinha/TelegramBot-Boilerplate 
-
 ____
 
 <h2 align="center"> Screenshots </h2> 
@@ -143,8 +141,7 @@ _____
 <br>
 <img src="https://telegra.ph/file/b5850b957f081cfe5f0a6.png" align="right" width="110">
 
-* copyright (C) 2023 by [Sanjit sinha](https://github.com/sanjit-sinha)
-* Licensed under the terms of the [The MIT License](https://github.com/sanjit-sinha/Tg-MediaInfoBot/blob/main/LICENSE)
+* Licensed under the terms of the [The MIT License](https://github.com/subashbuilds/MediaInfo/blob/main/LICENSE)
 
 
 -------
