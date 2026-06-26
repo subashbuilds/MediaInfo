@@ -6,9 +6,9 @@
 </div>
 
 <p align="center">
-<img src="https://img.shields.io/github/stars/sanjit-sinha/Tg-MediaInfoBot">
-<img src="https://img.shields.io/github/forks/sanjit-sinha/Tg-MediaInfoBot">
-<img src="https://img.shields.io/github/repo-size/sanjit-sinha/Tg-MediaInfoBot">
+<img src="https://img.shields.io/github/stars/subashbuilds/MediaInfo">
+<img src="https://img.shields.io/github/forks/subashbuilds/MediaInfo">
+<img src="https://img.shields.io/github/repo-size/subashbuilds/MediaInfo">
 <img src="https://img.shields.io/badge/License-MIT-green.svg">
 <img src="https://www.repostatus.org/badges/latest/active.svg">
 </p>
