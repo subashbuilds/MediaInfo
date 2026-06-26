@@ -1,5 +1,3 @@
-<div align="center">
-<img src="https://graph.org/file/d305c3259ca8d5324ee61.png" align="center" style="width: 30%" />
 
 
 <h2 align="center">Telegram MediaInfoBot</h2>
