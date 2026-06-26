@@ -81,7 +81,7 @@ cd Tg-MediaInfoBot
 pip3 install -U -r requirements.txt
 ```
 
-Now edit the config vars by typing `nano config.env` and save it by pressing <kbd>ctrl</kbd>+<kbd>o</kbd> and <kbd>ctrl</kbd>+<kbd>x</kbd>.
+Now edit the config vars by typing `nano config.env` and save it by pressing <kbd>ctrl</kbd>+<kbd>x</kbd>.
 <br>
 
 <details>
