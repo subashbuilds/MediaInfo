@@ -1,0 +1,17 @@
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+requests_toolbelt
+pyrogram==2.0.73
+TgCrypto==1.2.4
+telegraph[aio]
+async-timeout
+apscheduler 
+cachetools 
+aiofiles
+requests
+urllib3
+uvloop
+httpx
+bs4
+python-dotenv
