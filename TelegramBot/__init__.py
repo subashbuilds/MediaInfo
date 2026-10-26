@@ -3,7 +3,55 @@ import sys
 import json
 import time
 import shutil
+from pathlib import Path
 from asyncio import get_event_loop, new_event_loop, set_event_loop
+
+# --------------------------------------------------
+# Initialize secret JSON files from environment variables
+# --------------------------------------------------
+
+# Repository root: parent directory of TelegramBot/
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def create_secret_file(env_name: str, filename: str) -> None:
+    """Create a JSON file from a environment variable."""
+
+    value = os.environ.get(env_name)
+
+    if not value:
+        raise RuntimeError(
+            f"Missing required Railway environment variable: {env_name}"
+        )
+
+    try:
+        parsed_json = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Railway variable {env_name} does not contain valid JSON."
+        ) from exc
+
+    file_path = PROJECT_ROOT / filename
+
+    file_path.write_text(
+        json.dumps(parsed_json, indent=2),
+        encoding="utf-8",
+    )
+
+    try:
+        file_path.chmod(0o600)
+    except OSError:
+        # Permissions may behave differently on some filesystems.
+        pass
+
+
+create_secret_file("TOKEN_JSON", "token.json")
+create_secret_file("CREDENTIALS_JSON", "credentials.json")
+
+# --------------------------------------------------
+# Existing application imports
+# --------------------------------------------------
+
 import uvloop
 import requests
 
