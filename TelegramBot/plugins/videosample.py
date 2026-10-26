@@ -1,144 +1,151 @@
-import asyncio
-import datetime
-import httpx
-import json
+"""
+Video sample (trim) generation from Google Drive links, direct download
+links and Telegram files.
+"""
+
+import os
 import re
-import subprocess
-import time
-import requests
+import random
+import datetime
+import traceback
 from urllib.parse import unquote
 
+import requests
+
 from pyrogram import Client, filters
-from TelegramBot.logging import LOGGER
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import MessageNotModified
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from TelegramBot.helpers.functions import *
-from TelegramBot.helpers.filters import check_auth
+from TelegramBot.helpers.functions import randstr, check_and_convert_time
+from TelegramBot.helpers.media_utils import (
+    GDRIVE_REGEX, URL_REGEX, run_process, get_media, get_duration_seconds,
+    telegram_head_download, probe_url_duration, cleanup_paths, safe_edit)
 from TelegramBot.helpers.gdrivehelper import GoogleDriveHelper
+from TelegramBot.helpers.filters import check_auth
+from TelegramBot.logging import LOGGER
+
+logger = LOGGER(__name__)
+
+TELEGRAM_UPLOAD_LIMIT = 1_900_000_000  # stay below the 2 GB bot upload limit
+
+# thumbnail for uploaded samples (fetched once at startup, non fatal on failure)
+thumb_path = "thumb.jpg"
+try:
+    _thumb = requests.get(
+        "https://te.legra.ph/file/508f1cd599bb3d9352e88.jpg", timeout=15)
+    if _thumb.status_code == 200 and _thumb.content:
+        with open(thumb_path, "wb") as _file:
+            _file.write(_thumb.content)
+    else:
+        thumb_path = None
+except Exception as error:
+    logger.warning(f"could not fetch sample thumbnail: {error}")
+    thumb_path = None
 
 
-# thumbnail of the video file.
-thumb_path = f"thumb.jpg"
-thumb = requests.get(
-    "https://te.legra.ph/file/508f1cd599bb3d9352e88.jpg", allow_redirects=True)
-open(thumb_path, "wb").write(thumb.content)
+def _thumb_or_none():
+    return thumb_path if thumb_path and os.path.exists(thumb_path) else None
 
 
-async def generate_videosample_from_link(
-    message,
-    replymsg,
-    file_url,
-    duration,
-    headers,
-    filename,
-    timestamp,
+async def generate_sample_from_link(
+    message, replymsg, file_url, duration, headers, filename, timestamp
 ):
-    """
-    Generates video sample from direct download link using ffmpeg.
-    """
-
-    await replymsg.edit(
-        f"Generating {duration} min video sample from `{unquote(filename)}`, please wait ...")
-    original_name = filename
-    filename = filename.replace(" ", ".")
+    """Cut a sample straight from a remote URL with ffmpeg (streaming copy)."""
+    await safe_edit(
+        replymsg,
+        f"✂️ Generating **{duration} min** sample from "
+        f"`{unquote(filename)}`, please wait ...")
 
     rand_str = randstr()
-    output_path = f"download/{rand_str}_{filename}"
+    output_path = f"download/{rand_str}_{filename.replace(' ', '.')}"
 
-    ffmpeg_command = (
-        f'ffmpeg -nostdin '
-        f'-user_agent "Mozilla/5.0" '
-        f'-headers "{headers}\r\n" '
-        f'-y '
-        f'-ss {timestamp} '
-        f'-i "{file_url}" '
-        f'-t 00:0{int(duration)}:00 '
-        f'-c:v copy '
-        f'-c:a copy '
-        f'"{output_path}"'
-    )
-    shell_output = await async_subprocess(ffmpeg_command)
-    print(shell_output)
-    print("Output exists:", os.path.exists(output_path))
-    print("Output path:", output_path)
+    _, output = await run_process(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+         "-user_agent", "Mozilla/5.0",
+         "-headers", headers + "\r\n",
+         "-y",
+         "-ss", str(timestamp),
+         "-i", file_url,
+         "-t", str(datetime.timedelta(minutes=duration)),
+         "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?",
+         "-c", "copy",
+         output_path],
+        timeout_seconds=1800)
+    if output:
+        logger.info(f"sample ffmpeg output: {output[:500]}")
 
-    if not os.path.exists(output_path):
-        return await replymsg.edit("FFmpeg failed to create the sample video.")
-    print(ffmpeg_command)
-    print(shell_output)
+    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
+        cleanup_paths(output_path)
+        return await safe_edit(replymsg, "❌ FFmpeg failed to create the sample video.")
 
-    if os.path.getsize(output_path) > 1900000000:
-        os.remove(output_path)
-        return await replymsg.edit(
-            "Sample file is larger than 2GB. Can not upload large sample files wich exceed Telegram Limits.")
+    if os.path.getsize(output_path) > TELEGRAM_UPLOAD_LIMIT:
+        cleanup_paths(output_path)
+        return await safe_edit(
+            replymsg,
+            "❌ Sample file is larger than 2 GB — it exceeds Telegram's upload limit.")
 
-    await replymsg.edit("Uploading the video file, Please wait...")
+    await safe_edit(replymsg, "📤 Uploading the video file, please wait ...")
     await message.reply_video(
         video=output_path,
-        caption=f"[**{duration}min Sample**] {original_name}",
-        thumb=thumb_path,
+        caption=f"[**{duration}min Sample**] {filename}",
+        thumb=_thumb_or_none(),
         quote=True)
 
-    await replymsg.delete()
-    os.remove(output_path)
+    try:
+        await replymsg.delete()
+    except Exception:
+        pass
+    cleanup_paths(output_path)
 
 
 async def gdrive_videosample(message, url, duration):
-    """
-    Generates video sample From Google Drive link.
-    """
-
-    replymsg = await message.reply_text("Checking your Gdrive link...", quote=True)
+    """Generate a video sample from a Google Drive link."""
+    replymsg = await message.reply_text(
+        "🔎 Checking your Google Drive link ...", quote=True)
     try:
         drive = GoogleDriveHelper()
         metadata = drive.get_metadata(url)
-        filename = metadata["name"]
+        filename = metadata.get("name") or "gdrive_video"
 
-        if "video" not in metadata["mimeType"]:
-            return await replymsg.edit("Can only generate sample from video file.**")
+        if "video" not in (metadata.get("mimeType") or ""):
+            return await safe_edit(
+                replymsg, "❌ Can only generate samples from a video file.")
 
-        file_url = drive.get_ddl_link(url)
-        bearer_token = drive.get_bearer_token()
-        headers = f"Authorization: Bearer {bearer_token}"
+        file_url = (
+            "https://www.googleapis.com/drive/v3/files/"
+            f"{drive.get_id(url)}?supportsAllDrives=true&alt=media"
+        )
+        headers = f"Authorization: Bearer {drive.get_bearer_token()}"
 
-        total_duration = await async_subprocess(f"ffprobe -headers '{headers}'  -v quiet -show_format -print_format json {file_url}")  
-        ffprobe_data = json.loads(total_duration)
-        total_duration = float(ffprobe_data["format"]["duration"])
-        
-        
-        # Generate a random timestamp between first 15-20% of the movie.
-        timestamp = total_duration * (random.uniform(15, 20) / 100)
+        total_duration = await probe_url_duration(file_url, headers)
+        if not total_duration:
+            return await safe_edit(
+                replymsg,
+                "❌ Could not read the video duration. Make sure the link is "
+                "public, is a proper video and is not rate limited.")
 
-        # converting final timestamp into HH:MM:SS format
-        timestamp = str(datetime.timedelta(seconds=int(timestamp)))
+        timestamp = str(datetime.timedelta(
+            seconds=int(total_duration * (random.uniform(15, 20) / 100))))
 
-        await generate_videosample_from_link(
+        await generate_sample_from_link(
             message, replymsg, file_url, duration, headers, filename, timestamp)
 
     except MessageNotModified:
         pass
     except Exception as error:
-        LOGGER(__name__).error(error)
-        return await replymsg.edit(
-            "Something went wrong while processing Gdrive link. Make sure that the link is public and is a proper video file.")
+        logger.error(f"gdrive videosample failed: {error}")
+        await safe_edit(
+            replymsg,
+            "❌ Something went wrong while processing the Google Drive link. "
+            "Make sure the link is public and is a proper video file.")
 
 
 async def ddl_videosample(message, url, duration):
-    """
-    Generates video sample from ddl.
-    """
-
+    """Generate a video sample from a direct download link."""
     replymsg = await message.reply_text(
-        "Checking direct download url....**", quote=True)
+        "🔎 Checking direct download url ...", quote=True)
     try:
-        file_url = url
-        from urllib.parse import urlparse
-
-        parsed = urlparse(url)
-
-        filename = os.path.basename(parsed.path)
-
+        filename = unquote(url.split("?")[0].rstrip("/").rsplit("/", 1)[-1])
         if not filename:
             filename = "sample.mkv"
         if "." not in filename:
@@ -146,185 +153,199 @@ async def ddl_videosample(message, url, duration):
         if len(filename) > 60:
             filename = filename[-60:]
 
-        headers = "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4136.7 Safari/537.36"
+        headers = (
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
 
-        # calculate total duration of the video file.
-        total_duration = await async_subprocess(f"ffprobe -headers '{headers}' -v quiet -show_format -print_format json {file_url} ")
-        ffprobe_data = json.loads(total_duration)
-        total_duration = float(ffprobe_data["format"]["duration"])
-    
-        # Generate a random timestamp between first 15-20% of the movie.
-        timestamp = total_duration * (random.uniform(15, 20) / 100)
+        total_duration = await probe_url_duration(url, headers)
+        if not total_duration:
+            return await safe_edit(
+                replymsg,
+                "❌ Could not read the video duration from this link. "
+                "Make sure it points to a proper video file.")
 
-        # convering final timestamp into HH:MM:SS format.
-        timestamp = str(datetime.timedelta(seconds=int(timestamp)))
+        timestamp = str(datetime.timedelta(
+            seconds=int(total_duration * (random.uniform(15, 20) / 100))))
 
-        await generate_videosample_from_link(
-            message, replymsg, file_url, duration, headers, filename, timestamp)
+        await generate_sample_from_link(
+            message, replymsg, url, duration, headers, filename, timestamp)
 
     except MessageNotModified:
         pass
     except Exception as error:
-        import traceback
-        traceback.print_exc()
-        LOGGER(__name__).error(error)
-        return await replymsg.edit(f"`{error}`")
+        logger.error(f"ddl videosample failed: {error}")
+        await safe_edit(
+            replymsg, "❌ Something went wrong while generating the sample "
+            "from the given link.")
 
-async def telegram_videosample(message, client, duration):
-    """
-    Generate video sample from Telegram Video File.
-    """
 
+async def telegram_videosample(client, media_message, duration):
+    """Generate a video sample from a Telegram file (partial download)."""
+    media = get_media(media_message)
+    if media is None:
+        return await media_message.reply_text(
+            "Reply to a video file to generate a sample.", quote=True)
+
+    mime = (getattr(media, "mime_type", "") or "")
+    if media_message.document and "video" not in mime:
+        return await media_message.reply_text(
+            "Can only generate samples from a video file.", quote=True)
+
+    filename = (getattr(media, "file_name", None)
+                or f"telegram_video_{media_message.id}")[:100]
+    file_size = getattr(media, "file_size", 0) or 0
+
+    replymsg = await media_message.reply_text(
+        f"✂️ Generating **{duration} min** sample from `{filename}`, "
+        "please wait ...", quote=True)
+    download_path = output_path = None
     try:
-        message = message.reply_to_message
-        if message.text:
-            return await message.reply_text(
-                "Reply to a proper video file to Generate sample.", quote=True)
+        # 1) download a small head to measure duration / bitrate
+        probe_path, mi_json, fp_json, _ = await telegram_head_download(
+            client, media_message, replymsg, filename, steps=(25, 75))
+        cleanup_paths(probe_path)
 
-        if message.media.value == "video":
-            media = message.video
+        total_duration = get_duration_seconds(mi_json, fp_json)
+        if not total_duration:
+            return await safe_edit(
+                replymsg,
+                "❌ Could not read the video duration from the downloaded part.")
 
-        elif message.media.value == "document":
-            media = message.document
-
-        else:
-            return await message.reply_text(
-                "Can only generate sample from a video file....", quote=True)
-
-        filename = str(media.file_name)
-        mime = media.mime_type
-        file_size = media.file_size
-
-        if message.media.value == "document" and "video" not in mime:
-            return await message.reply_text(
-                "Can only generate sample from a video file. Please wait...", quote=True)
-
-        replymsg = await message.reply_text(
-            f"Generating {duration} min video sample from `{unquote(filename)}`, please wait...",
-            quote=True)
+        # 2) download only the bytes the sample needs (never the whole file)
+        bytes_per_second = (file_size / total_duration) if file_size else 0
+        needed_mb = int((bytes_per_second * duration * 60) / (1024 * 1024)) + 5
+        download_mb = max(min(needed_mb, 2000), 25)
 
         rand_str = randstr()
         download_path = f"download/{rand_str}_{filename}"
+        output_path = f"download/{rand_str}_sample_{filename}"
 
-        async for chunk in client.stream_media(message, limit=5):
-            with open(download_path, "ab") as f:
-                f.write(chunk)
-
-        mediainfo_json = await async_subprocess(
-            f"mediainfo '{download_path}' --Output=JSON")
-        mediainfo_json = json.loads(mediainfo_json)
-        total_duration = mediainfo_json["media"]["track"][0]["Duration"]
-
-        bitrate = float(file_size) / float(total_duration)
-        os.remove(download_path)
-
-        # limit of partial file to be downloaded from given time duration
-        download_limit: int = ((bitrate) * (duration * 60)) * 0.000001
-        async for chunk in client.stream_media(message, limit=int(download_limit)):
-            with open(f"{download_path}", "ab") as file:
+        await safe_edit(
+            replymsg, f"⬇️ Downloading the sample part (~{download_mb} MB) ...")
+        with open(download_path, "wb") as file:
+            async for chunk in client.stream_media(media_message, limit=download_mb):
                 file.write(chunk)
 
-        # fixing the file metadata.
-        output_path = f"download/{rand_str}_output_{filename}"
-        ffmpeg_command = f"ffmpeg -ss 00:00:0 -i '{download_path}' -t 00:0'{int(duration)}':00 -map 0:v? -map 0:a? -map 0:s? -map 0:d? -c copy '{output_path}'"
-        await async_subprocess(ffmpeg_command)
+        # 3) remux the requested duration without re-encoding
+        await run_process(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+             "-i", download_path,
+             "-t", str(datetime.timedelta(minutes=duration)),
+             "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?",
+             "-c", "copy",
+             output_path],
+            timeout_seconds=1800)
 
-        await replymsg.edit("Uploading the video file, Please wait...")
-        await message.reply_video(
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
+            return await safe_edit(
+                replymsg, "❌ FFmpeg failed to create the sample video.")
+
+        if os.path.getsize(output_path) > TELEGRAM_UPLOAD_LIMIT:
+            return await safe_edit(
+                replymsg,
+                "❌ Sample file is larger than 2 GB — it exceeds Telegram's upload limit.")
+
+        await safe_edit(replymsg, "📤 Uploading the video file, please wait ...")
+        await media_message.reply_video(
             video=output_path,
             caption=f"[**{duration}min Sample**] {filename}",
-            thumb=thumb_path,
+            thumb=_thumb_or_none(),
             quote=True)
 
-        await replymsg.delete()
-        os.remove(download_path)
-        os.remove(output_path)
+        try:
+            await replymsg.delete()
+        except Exception:
+            pass
 
     except Exception as error:
-        LOGGER(__name__).error(error)
-        return await message.reply_text(
-            "Something went wrong while generating sample video from Telegram file.",
-            quote=True)
+        traceback.print_exc()
+        logger.error(f"telegram videosample failed: {error}")
+        await safe_edit(
+            replymsg,
+            "❌ Something went wrong while generating the sample from this Telegram file.")
+    finally:
+        cleanup_paths(download_path, output_path)
 
 
-sample_duration = [
+sample_duration_buttons = [
     [
-        InlineKeyboardButton("1min", callback_data="videosample_1"),
-        InlineKeyboardButton("3min", callback_data="videosample_3"),
-        InlineKeyboardButton("5min", callback_data="videosample_5"),
+        InlineKeyboardButton("1 min", callback_data="videosample_1"),
+        InlineKeyboardButton("3 min", callback_data="videosample_3"),
+        InlineKeyboardButton("5 min", callback_data="videosample_5"),
     ]
 ]
 
 info_dictionary: dict = {}
 
 
-@Client.on_callback_query(filters.regex("videosample_"))
-async def videosample_duration(client, CallbackQuery):
-    duration = int(CallbackQuery.data.split("_")[-1])
-    message_id = CallbackQuery.message.reply_to_message.id
-    await client.delete_messages(
-        CallbackQuery.message.chat.id, CallbackQuery.message.id)
+@Client.on_callback_query(filters.regex(r"^videosample_\d+$"))
+async def videosample_duration(client, callback_query):
+    duration = int(callback_query.data.split("_")[-1])
 
-    message = info_dictionary[message_id]["message"]
-    link_type = info_dictionary[message_id]["type"]
+    original = callback_query.message.reply_to_message
+    info = info_dictionary.pop(original.id, None) if original else None
+    if not info:
+        return await callback_query.answer(
+            "This menu is too old, please run /sample again.", show_alert=True)
 
-    if link_type == "gdrive":
-        return await gdrive_videosample(
-            message, info_dictionary[message_id]["url"], duration)
-            
-    if link_type == "ddl":
-        return await ddl_videosample(
-            message, info_dictionary[message_id]["url"], duration)
-            
+    try:
+        await client.delete_messages(
+            callback_query.message.chat.id, callback_query.message.id)
+    except Exception:
+        pass
+    await callback_query.answer()
+
+    if info["type"] == "gdrive":
+        return await gdrive_videosample(info["message"], info["url"], duration)
+
+    if info["type"] == "ddl":
+        return await ddl_videosample(info["message"], info["url"], duration)
+
     return await telegram_videosample(
-        message, info_dictionary[message_id]["client"], duration)
+        info["client"], info["message"].reply_to_message, duration)
 
 
 @Client.on_message(filters.command(["sample", "trim"]) & check_auth)
 async def video_sample(client: Client, message: Message):
-    """
-    Generates video sample from Google Drive links, Telegram files or direct download links.
-    """
+    """Generate a video sample from GDrive links, Telegram files or direct links."""
+
+    picker = (
+        "⏱ Choose the duration of the sample video:",
+        InlineKeyboardMarkup(sample_duration_buttons),
+    )
 
     if message.reply_to_message:
-        info_dictionary[message.id] = {}
-        info_dictionary[message.id]["message"] = message
-        info_dictionary[message.id]["client"] = client
-        info_dictionary[message.id]["type"] = "telegram"
+        if get_media(message.reply_to_message) is None:
+            return await message.reply_text(
+                "Reply to a video file to generate a sample.", quote=True)
+        info_dictionary[message.id] = {
+            "message": message, "client": client, "type": "telegram"}
         return await message.reply_text(
-            "Choose time duration of sample video.",
-            reply_markup=InlineKeyboardMarkup(sample_duration),
-            quote=True)
+            picker[0], reply_markup=picker[1], quote=True)
 
     if len(message.command) < 2:
         return await message.reply_text(
-            "Generates video sample from Google Drive links, Telegram files or direct download links.",
+            "**Generates a video sample from Google Drive links, Telegram files "
+            "or direct download links.**\n\n"
+            "Reply to a video with `/sample`, or pass a link: "
+            "`/sample https://example.com/video.mkv`",
             quote=True)
 
     user_input = message.text.split(None, 1)[1]
-    if url_match := re.search(r"https://drive\.google\.com/\S+", user_input):
-        url = url_match.group(0)
-        info_dictionary[message.id] = {}
-        info_dictionary[message.id]["message"] = message
-        info_dictionary[message.id]["type"] = "gdrive"
-        info_dictionary[message.id]["url"] = url
-        return await message.reply_text(
-            "Choose time duration of sample video.",
-            reply_markup=InlineKeyboardMarkup(sample_duration),
-            quote=True)
 
-    if url_match := re.search(
-        r"https?://([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:\/~+#-]*[\w@?^=%&\/~+#-])",
-        user_input,
-    ):
-        url = url_match.group(0)
-        info_dictionary[message.id] = {}
-        info_dictionary[message.id]["message"] = message
-        info_dictionary[message.id]["type"] = "ddl"
-        info_dictionary[message.id]["url"] = url
+    if url_match := re.search(GDRIVE_REGEX, user_input):
+        info_dictionary[message.id] = {
+            "message": message, "client": client,
+            "type": "gdrive", "url": url_match.group(0)}
         return await message.reply_text(
-            "Choose time duration of sample video.",
-            reply_markup=InlineKeyboardMarkup(sample_duration),
-            quote=True)
-    return await message.reply_text(
-        "This type of link is not supported.", quote=True)
+            picker[0], reply_markup=picker[1], quote=True)
+
+    if url_match := re.search(URL_REGEX, user_input):
+        info_dictionary[message.id] = {
+            "message": message, "client": client,
+            "type": "ddl", "url": url_match.group(0)}
+        return await message.reply_text(
+            picker[0], reply_markup=picker[1], quote=True)
+
+    return await message.reply_text("This type of link is not supported.", quote=True)

@@ -1,7 +1,9 @@
 from TelegramBot.version import __python_version__, __version__, __pyro_version__
 
 
-COMMAND_TEXT = """🗒️ Documentation for commands available to user's 
+COMMAND_TEXT = """🗒️ Documentation for commands available to users
+
+**⚡ No commands needed:** just send any media file or link and an inline menu with all actions appears automatically.
 
 • /start: To Get start message and help guide. 
 
@@ -9,15 +11,15 @@ COMMAND_TEXT = """🗒️ Documentation for commands available to user's
 
 • /paste: paste text in katb.in website.
 
-• /screenshot or /ss: Generates Screenshot from video file
+• /screenshot or /ss: Generates screenshots from a video file.
 
-• /mediainfo or /m: Generates Mediainfo of file. 
+• /mediainfo or /m: Generates detailed Mediainfo of a file (Telegram files, direct download links and Google Drive links).
 
-• /sample or /trim: Generates Video sample file from a video.
+• /sample or /trim: Generates a video sample from a video.
 
-• /spek or /sox: Generates audio Spectogram from Telegram audio files.
+• /spek or /sox: Generates audio spectrograms in classic SoX style — reply to an **audio** file for the full audio, or to a **video** file to get one spectrogram for **each** audio track.
 
-• **Additional Flags** for screenshot and mediainfo command :-
+• **Additional Flags** for screenshot and mediainfo commands :-
 
 `--count=10` [ Number of screenshots. Default 10, Max 20 ], 
 

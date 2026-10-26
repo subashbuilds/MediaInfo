@@ -31,22 +31,27 @@ def html_builder(title: str, text: str):
             page += "<b>📄 General</b><br>"
             continue
 
-        if line == "Video":
+        if re.match(r"Video(\s+#\d+)?$", line):
             flush()
-            page += "<b>🎥 Video</b><br>"
+            page += f"<b>🎥 {line}</b><br>"
             continue
 
-        if line.startswith("Audio"):
+        if re.match(r"Audio(\s+#\d+)?$", line):
             flush()
             page += f"<b>🔊 {line}</b><br>"
             continue
 
-        if re.match(r"Text\s+#\d+", line):
+        if re.match(r"Text(\s+#\d+)?$", line):
             flush()
             page += f"<b>💬 {line}</b><br>"
             continue
 
-        if line == "Menu":
+        if re.match(r"Image(\s+#\d+)?$", line):
+            flush()
+            page += f"<b>🖼 {line}</b><br>"
+            continue
+
+        if re.match(r"Menu(\s+#\d+)?$", line):
             flush()
             page += "<b>📚 Chapters</b><br>"
             continue
