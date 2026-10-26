@@ -121,7 +121,12 @@ async def clear_download():
     os.mkdir("download")
 
 
-scheduler = AsyncIOScheduler(event_loop=loop)
+from zoneinfo import ZoneInfo
+
+scheduler = AsyncIOScheduler(
+    event_loop=loop,
+    timezone=ZoneInfo("Asia/Kolkata"),
+)
 scheduler.add_job(clear_download, "interval", minutes=1440)
 scheduler.start()
 
