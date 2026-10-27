@@ -17,8 +17,8 @@
 - **Automatic action menu** — just send any media file (video / audio / document / voice note) or a direct download / Google Drive link, and the bot instantly replies with an inline menu: 🎬 Mediainfo · 📄 Raw info · 📸 Screenshots · 🎵 Spectrogram · ✂️ Sample. **No slash commands needed.**
 - Generating **detailed Mediainfo** from Google Drive links, direct download links, and Telegram files — full `mediainfo -f` output (all fields: colour primaries, HDR metadata, stream sizes, languages, tags) posted to a Telegraph page, plus a rich summary (container, duration, resolution, HDR, codecs, audio tracks, subtitles) directly in the chat.
 - Creating screenshots from Google Drive links, direct download links, and Telegram files, and posting them on slow.pics
-- Generating custom-duration video samples from video files.
-- Creating **spectrograms in the classic SoX style** (wide 2400px image, Kaiser window, title + track info) — for **video files the bot generates one spectrogram per audio track**, each captioned with codec, channels, sample rate and language. Voice notes and nameless audio files are supported too.
+- Generating custom-duration video samples (1 / 3 / 5 min) cut from a **random position** (~15–40% into the video) instead of the beginning.
+- Creating **spectrograms in the classic SoX style** (wide 2400px image, Kaiser window, title + track info) — for **video files the bot generates one spectrogram per audio track**, each captioned with codec, bitrate (192 kbps / 640 kbps …), channels, sample rate and language. Each track is analysed in mono so the image is a **single graph** (no double pane). Voice notes and nameless audio files are supported too.
 - **Everything works via partial downloads** — the bot streams only the head of the file (25 → 75 → 200 MB stages until the media parses) or uses HTTP Range requests for links, so it **never downloads the whole file**.
 - Pasting text to the katb.in website.
 
@@ -49,8 +49,8 @@ Simply send / forward any media file or paste a link in the chat — the bot rep
 | 🎬 **Mediainfo** | Detailed mediainfo → Telegraph page + summary in chat |
 | 📄 **Raw info** | Raw mediainfo text sent as a document |
 | 📸 **Screenshots** | 10 screenshots uploaded to slow.pics |
-| 🎵 **Spectrogram** | One spectrogram per audio track |
-| ✂️ **Sample** | Pick 1 / 3 / 5 minutes → sample video |
+| 🎵 **Spectrogram** | One single-graph spectrogram per audio track, with bitrate |
+| ✂️ **Sample** | Pick 1 / 3 / 5 minutes → sample video from a random position |
 
 Only the person who sent the media (or a sudo user) can press the buttons.
 
@@ -80,7 +80,7 @@ Only the person who sent the media (or a sudo user) can press the buttons.
 - **Telegram files** are downloaded progressively: the bot fetches the first 25 MB, tries to parse them with ffprobe/MediaInfo, and only downloads more (75 MB → 200 MB) if needed. Small audio files are fetched fully so spectrograms cover the whole track.
 - **Links / Google Drive** are read with HTTP Range requests (`bytes=0-N`) using the same progressive stages — authenticated with your Google token for Drive links.
 - The raw text output of `mediainfo -f` (all available fields) is cleaned up and posted to Telegraph; the chat reply shows a compact summary built from the MediaInfo JSON (duration, resolution, fps, HDR, per-track codecs and languages).
-- Spectrograms are rendered with SoX (`-x 2400 -y 900 -z 120 -w Kaiser`), one per audio track, extracted with `ffmpeg -map 0:a:N`.
+- Spectrograms are rendered with SoX (`-x 2400 -y 900 -z 120 -w Kaiser`), one per audio track, extracted as **mono** PCM with `ffmpeg -map 0:a:N -ac 1` (mono keeps SoX to a single graph instead of one pane per channel).
 
  _____
  

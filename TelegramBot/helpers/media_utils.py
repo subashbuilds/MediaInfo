@@ -413,6 +413,8 @@ def list_audio_tracks(fp_json, mi_json=None):
                 "channels": stream.get("channels"),
                 "channel_layout": stream.get("channel_layout") or "",
                 "sample_rate": stream.get("sample_rate"),
+                "bit_rate": stream.get("bit_rate"),
+                "bitrate_mode": None,
                 "language": (tags.get("language") or tags.get("LANGUAGE")
                              or tags.get("lang") or ""),
                 "title": tags.get("title") or tags.get("TITLE") or "",
@@ -430,16 +432,39 @@ def list_audio_tracks(fp_json, mi_json=None):
                 "channels": track.get("Channel(s)"),
                 "channel_layout": track.get("ChannelLayout") or "",
                 "sample_rate": track.get("SamplingRate"),
+                "bit_rate": track.get("BitRate"),
+                "bitrate_mode": track.get("BitRate_Mode"),
                 "language": track.get("Language") or "",
                 "title": track.get("Title") or "",
             })
+
+    # ffprobe often omits `bit_rate` for audio streams — fill it in from the
+    # MediaInfo JSON (both list audio tracks in the same container order)
+    if tracks and mi_json:
+        mi_audio = [t for t in (mi_json.get("media", {}).get("track") or [])
+                    if t.get("@type") == "Audio"]
+        for index, track in enumerate(tracks[:len(mi_audio)]):
+            if not track.get("bit_rate"):
+                track["bit_rate"] = mi_audio[index].get("BitRate")
+            if not track.get("bitrate_mode"):
+                track["bitrate_mode"] = mi_audio[index].get("BitRate_Mode")
 
     return tracks
 
 
 def describe_audio_track(track):
-    """Human readable one-liner: `E-AC-3 · 6 ch (5.1) · 48 kHz · [ENG] · Title`."""
+    """Human readable one-liner: `E-AC-3 · 640 kbps · 6 ch (5.1) · 48 kHz · [ENG]`."""
     parts = [str(track.get("codec") or "Audio")]
+
+    bit_rate = track.get("bit_rate")
+    if bit_rate:
+        try:
+            kbps = int(float(str(bit_rate).replace(",", "")) / 1000)
+            if kbps > 0:
+                mode = (track.get("bitrate_mode") or "").strip().upper()
+                parts.append(f"{kbps} kbps" + (" VBR" if mode == "VBR" else ""))
+        except (TypeError, ValueError):
+            pass
 
     channels = track.get("channels")
     layout = track.get("channel_layout") or ""
@@ -470,7 +495,9 @@ def describe_audio_track(track):
 
 async def extract_audio_track(src_path, stream_index, out_wav, max_seconds=None):
     """
-    Extract one audio track (by audio-relative index) as 48 kHz stereo PCM.
+    Extract one audio track (by audio-relative index) as 48 kHz MONO PCM.
+    Mono matters: SoX draws one spectrogram pane PER CHANNEL, so a stereo
+    wav would show a double graph for a single audio track.
     `max_seconds` limits how much of the input is decoded.
     """
     if not os.path.exists(src_path):
@@ -483,7 +510,7 @@ async def extract_audio_track(src_path, stream_index, out_wav, max_seconds=None)
         "-i", src_path,
         "-map", f"0:a:{stream_index}",
         "-vn", "-sn", "-dn",
-        "-ac", "2", "-ar", "48000",
+        "-ac", "1", "-ar", "48000",
         "-c:a", "pcm_s16le",
         out_wav,
     ]

@@ -19,7 +19,8 @@ from pyrogram.errors import MessageNotModified
 from TelegramBot.helpers.functions import randstr, check_and_convert_time
 from TelegramBot.helpers.media_utils import (
     GDRIVE_REGEX, URL_REGEX, run_process, get_media, get_duration_seconds,
-    telegram_head_download, probe_url_duration, cleanup_paths, safe_edit)
+    covered_duration, telegram_head_download, probe_url_duration,
+    cleanup_paths, safe_edit)
 from TelegramBot.helpers.gdrivehelper import GoogleDriveHelper
 from TelegramBot.helpers.filters import check_auth
 from TelegramBot.logging import LOGGER
@@ -27,6 +28,11 @@ from TelegramBot.logging import LOGGER
 logger = LOGGER(__name__)
 
 TELEGRAM_UPLOAD_LIMIT = 1_900_000_000  # stay below the 2 GB bot upload limit
+
+# where a sample starts: a random percentage into the available video
+# (Telegram files: the downloaded part; links: the whole video)
+SAMPLE_START_MIN_PERCENT = 15
+SAMPLE_START_MAX_PERCENT = 40
 
 # thumbnail for uploaded samples (fetched once at startup, non fatal on failure)
 thumb_path = "thumb.jpg"
@@ -87,7 +93,7 @@ async def generate_sample_from_link(
     await safe_edit(replymsg, "📤 Uploading the video file, please wait ...")
     await message.reply_video(
         video=output_path,
-        caption=f"[**{duration}min Sample**] {filename}",
+        caption=f"[**{duration}min Sample** from {timestamp}] {filename}",
         thumb=_thumb_or_none(),
         quote=True)
 
@@ -124,8 +130,9 @@ async def gdrive_videosample(message, url, duration):
                 "❌ Could not read the video duration. Make sure the link is "
                 "public, is a proper video and is not rate limited.")
 
+        percent = random.uniform(SAMPLE_START_MIN_PERCENT, SAMPLE_START_MAX_PERCENT)
         timestamp = str(datetime.timedelta(
-            seconds=int(total_duration * (random.uniform(15, 20) / 100))))
+            seconds=int(total_duration * (percent / 100))))
 
         await generate_sample_from_link(
             message, replymsg, file_url, duration, headers, filename, timestamp)
@@ -165,8 +172,9 @@ async def ddl_videosample(message, url, duration):
                 "❌ Could not read the video duration from this link. "
                 "Make sure it points to a proper video file.")
 
+        percent = random.uniform(SAMPLE_START_MIN_PERCENT, SAMPLE_START_MAX_PERCENT)
         timestamp = str(datetime.timedelta(
-            seconds=int(total_duration * (random.uniform(15, 20) / 100))))
+            seconds=int(total_duration * (percent / 100))))
 
         await generate_sample_from_link(
             message, replymsg, url, duration, headers, filename, timestamp)
@@ -212,9 +220,11 @@ async def telegram_videosample(client, media_message, duration):
                 replymsg,
                 "❌ Could not read the video duration from the downloaded part.")
 
-        # 2) download only the bytes the sample needs (never the whole file)
+        # 2) download only the bytes the sample needs (never the whole file).
+        #    ~50% extra head-room gives the sample room to start at a random
+        #    position inside the downloaded part instead of the very beginning.
         bytes_per_second = (file_size / total_duration) if file_size else 0
-        needed_mb = int((bytes_per_second * duration * 60) / (1024 * 1024)) + 5
+        needed_mb = int((bytes_per_second * duration * 60 * 1.5) / (1024 * 1024)) + 5
         download_mb = max(min(needed_mb, 2000), 25)
 
         rand_str = randstr()
@@ -227,15 +237,45 @@ async def telegram_videosample(client, media_message, duration):
             async for chunk in client.stream_media(media_message, limit=download_mb):
                 file.write(chunk)
 
-        # 3) remux the requested duration without re-encoding
-        await run_process(
-            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-             "-i", download_path,
-             "-t", str(datetime.timedelta(minutes=duration)),
-             "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?",
-             "-c", "copy",
-             output_path],
-            timeout_seconds=1800)
+        # 3) pick a random start position inside the downloaded part
+        sample_seconds = duration * 60
+        covered = (covered_duration(
+            total_duration, os.path.getsize(download_path),
+            file_size) or total_duration)
+        latest_start = max(0.0, covered - sample_seconds - 2)
+        percent = random.uniform(SAMPLE_START_MIN_PERCENT, SAMPLE_START_MAX_PERCENT)
+        start_seconds = min(latest_start, covered * (percent / 100))
+        timestamp = str(datetime.timedelta(seconds=int(start_seconds)))
+
+        # 4) remux the requested duration without re-encoding
+        seek_args = ["-ss", timestamp] if start_seconds >= 1 else []
+        ffmpeg_args = [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            *seek_args,
+            "-i", download_path,
+            "-t", str(datetime.timedelta(minutes=duration)),
+            "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?",
+            "-c", "copy",
+            output_path]
+
+        if start_seconds >= 1:
+            await safe_edit(
+                replymsg, f"✂️ Cutting the sample from `{timestamp}` ...")
+        await run_process(ffmpeg_args, timeout_seconds=1800)
+
+        if (not os.path.exists(output_path)
+                or os.path.getsize(output_path) < 1024) and seek_args:
+            # seeking failed on this container — fall back to the file start
+            await run_process(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                 "-y",
+                 "-i", download_path,
+                 "-t", str(datetime.timedelta(minutes=duration)),
+                 "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?",
+                 "-c", "copy",
+                 output_path],
+                timeout_seconds=1800)
+            timestamp = "00:00:00"
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
             return await safe_edit(
@@ -249,7 +289,7 @@ async def telegram_videosample(client, media_message, duration):
         await safe_edit(replymsg, "📤 Uploading the video file, please wait ...")
         await media_message.reply_video(
             video=output_path,
-            caption=f"[**{duration}min Sample**] {filename}",
+            caption=f"[**{duration}min Sample** from {timestamp}] {filename}",
             thumb=_thumb_or_none(),
             quote=True)
 
