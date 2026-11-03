@@ -40,18 +40,66 @@ def _format_duration(seconds):
     return f"{secs}s"
 
 
+# `mediainfo -f` prints one field more than once (raw value, human value,
+# timecode...) and repeats a block of bookkeeping fields for every stream.
+# A file with 38 subtitle tracks turns that into ~67 KB of text, past
+# Telegraph's 64 KiB page limit (CONTENT_TOO_BIG), so the repeated values are
+# collapsed and the bookkeeping fields dropped.
+_MI_NOISE_FIELDS = frozenset((
+    "Count", "Count of stream of this kind", "Kind of stream",
+    "Stream identifier", "StreamOrder", "Unique ID",
+    "Format/Url", "Format/Info", "Codec ID/Info",
+    "Format/Extensions usually used", "Internet media type",
+))
+
+
+def _mi_field_name(line):
+    """Field name of a `Name : value` line, or None for headers / blank lines."""
+    name, separator, _ = line.partition(" : ")
+    return name.strip() if separator else None
+
+
+def _is_noise_field(name):
+    return name in _MI_NOISE_FIELDS or name.endswith("_Source")
+
+
 def clean_mediainfo_text(text):
-    """Drop truncation noise, adjacent duplicates and blank-line runs."""
+    """
+    Drop truncation noise, repeated values and blank-line runs.
+
+    Fields printed under the same name for one stream are collapsed to their
+    single most readable value (the longest one, which is the human readable
+    form rather than the raw number), and purely internal fields are removed.
+    """
     lines = []
     for line in text.splitlines():
         if "IsTruncated" in line or "FileExtension_Invalid" in line:
             continue
         lines.append(line.rstrip())
 
-    remove_N(lines)  # `mediainfo -f` prints raw + readable value of some fields
+    remove_N(lines)
+
+    collapsed = []
+    index = 0
+    while index < len(lines):
+        name = _mi_field_name(lines[index])
+        if name is None:
+            collapsed.append(lines[index])
+            index += 1
+            continue
+
+        end, best = index, lines[index]
+        while end + 1 < len(lines) and _mi_field_name(lines[end + 1]) == name:
+            end += 1
+            if len(lines[end]) >= len(best):
+                best = lines[end]
+
+        if not _is_noise_field(name):
+            collapsed.append(best)
+        index = end + 1
 
     cleaned, previous_blank = [], False
-    for line in lines:
+    for line in collapsed:
         if not line:
             if previous_blank:
                 continue
