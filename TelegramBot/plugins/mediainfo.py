@@ -111,6 +111,30 @@ def clean_mediainfo_text(text):
     return "\n".join(cleaned).strip()
 
 
+def _mi_field_label(line):
+    """(prefix-before-colon, field label) of a `Name : value` line, or None."""
+    position = line.find(":")
+    if position < 0:
+        return None
+    prefix, label = line[:position], line[:position].strip()
+    return (prefix, label) if label else None
+
+
+def _mi_value_column(lines):
+    """Character column `mediainfo` aligns its values at (blank lines skipped)."""
+    for line in lines:
+        parsed = _mi_field_label(line)
+        if parsed:
+            return len(parsed[0])
+    return 41
+
+
+def _set_mi_value(line, value):
+    """Replace the value of a `Name : value` line, keeping its alignment."""
+    prefix = line[:line.find(":")]
+    return f"{prefix}: {value}"
+
+
 async def build_mediainfo(path, mi_json, display_name, real_size=None, partial=False):
     """
     Run mediainfo in full-detail mode (`-f`, every known field) on the
@@ -118,9 +142,9 @@ async def build_mediainfo(path, mi_json, display_name, real_size=None, partial=F
 
       * restore the original file name (partial files get random names)
       * restore the real file size and real overall bitrate
-      * replace per-stream sizes with bitrate estimates when only part of
-        the file was read (MediaInfo would report the seen portion only)
-      * strip truncation warnings
+      * give every video / audio / text track a stream size (estimated from its
+        bitrate and marked `~` when only part of the file was read, or when
+        MediaInfo reports no stream size at all)
 
     Returns (text, mi_json).
     """
@@ -131,6 +155,9 @@ async def build_mediainfo(path, mi_json, display_name, real_size=None, partial=F
     duration = get_duration_seconds(mi_json, None)
 
     lines = full_text.splitlines()
+    value_column = _mi_value_column(lines)
+    size_prefix = "Stream size".ljust(value_column)
+    sections = []        # (section_type, section_index, start_line, has_size)
     section_type = None
     section_index = 0
     for index, line in enumerate(lines):
@@ -142,19 +169,20 @@ async def build_mediainfo(path, mi_json, display_name, real_size=None, partial=F
             if header:
                 section_type = header.group(1)
                 section_index = (int(header.group(2)) - 1) if header.group(2) else 0
+                sections.append([section_type, section_index, index, False])
             else:
                 section_type = None
             continue
 
         if "Complete name" in line:
-            lines[index] = re.sub(r": .+", lambda _: ": " + display_name, line)
+            lines[index] = _set_mi_value(line, display_name)
 
         elif "File size" in line and real_size:
             try:
                 readable = get_readable_bytes(int(real_size))
             except (TypeError, ValueError):
                 continue
-            lines[index] = re.sub(r": .+", lambda _: ": " + readable, line)
+            lines[index] = _set_mi_value(line, readable)
 
         elif (
             "Overall bit rate" in line
@@ -169,20 +197,36 @@ async def build_mediainfo(path, mi_json, display_name, real_size=None, partial=F
                 bitrate = get_readable_bitrate((int(real_size) * 8) / (duration * 1000))
             except (TypeError, ValueError, ZeroDivisionError):
                 continue
-            lines[index] = re.sub(r": .+", lambda _: ": " + bitrate, line)
+            lines[index] = _set_mi_value(line, bitrate)
 
-        elif (
-            partial and duration
-            and section_type in ("Video", "Audio", "Text")
-            and stripped.startswith("Stream size")
-        ):
+        elif stripped.startswith("Stream size") and partial and section_type in (
+                "Video", "Audio", "Text") and duration:
             # only part of the file was read — MediaInfo's own stream size
             # covers just the seen part, so replace it with the estimate
             track = _mi_track(mi_json, section_type, section_index) or {}
             estimate = _estimate_stream_size(track, duration)
             if estimate:
-                lines[index] = re.sub(
-                    r": .+", lambda _: ": ~" + get_readable_bytes(estimate), line)
+                lines[index] = _set_mi_value(
+                    line, "~" + get_readable_bytes(estimate))
+            if sections:
+                sections[-1][3] = True
+
+        elif stripped.startswith("Stream size") and sections:
+            sections[-1][3] = True
+
+    # MediaInfo only prints a stream size for some containers, so a track
+    # without one gets an estimate from its bitrate (marked `~`), inserted as
+    # the first line under its header. Done last-first so earlier positions
+    # of the list stay valid.
+    if duration:
+        for track_type, track_index, start, has_size in reversed(sections):
+            if has_size:
+                continue
+            track = _mi_track(mi_json, track_type, track_index) or {}
+            estimate = _estimate_stream_size(track, duration)
+            if estimate:
+                lines.insert(
+                    start + 1, f"{size_prefix}: ~{get_readable_bytes(estimate)}")
 
     return clean_mediainfo_text("\n".join(lines)), mi_json
 

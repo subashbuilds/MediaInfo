@@ -17,7 +17,7 @@ COMMAND_TEXT = """🗒️ Documentation for commands available to users
 
 • /sample or /trim: Generates a video sample from a video.
 
-• /spek or /sox: Generates audio spectrograms in the spek 0.8.5 look (SoX palette, header, kHz/mm:ss axes and dB legend) — reply to an **audio** file for the full audio, or to a **video** file to get one spectrogram for **each** audio track.
+• /spek or /sox: Generates audio spectrograms in the spek 0.8.5 look (SoX palette, header, kHz axis, 5-minute time axis ending at the real track length, dB legend) — reply to an **audio** or **video** file to get one spectrogram of the **whole** audio for **each** audio track (downmixed to mono).
 
 • **Additional Flags** for screenshot and mediainfo commands :-
 

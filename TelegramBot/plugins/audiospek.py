@@ -1,12 +1,15 @@
 """
-Spectrogram generation in the classic SoX style (dark background, vivid
-green→yellow→red heat colours, kHz + time axes, title and track info).
+Spectrogram generation in the spek 0.8.5 / SoX style (dark background, SoX
+heat palette, kHz + time axes, file name and track info).
 
-  * audio files  -> one spectrogram of the full audio
-  * video files  -> one spectrogram for EVERY audio track
-  * direct links -> partial download, first minutes of audio analysed
+  * audio files  -> one spectrogram of the FULL audio
+  * video files  -> one spectrogram for EVERY audio track (full audio)
+  * direct links -> whole file when it is small/medium, otherwise the first
+                    part that fits the download budget
 
-Nothing is downloaded in full unless the file is a small audio file.
+Audio files are downloaded in full; videos too (the spectrogram is only useful
+when it covers the whole track). Nothing is analysed partially except very
+large remote links.
 """
 
 import os
@@ -30,14 +33,18 @@ from TelegramBot.logging import LOGGER
 logger = LOGGER(__name__)
 
 MAX_TRACKS = 10                # Telegram albums cap at 10 photos anyway
-LINK_ANALYSIS_SECONDS = 600    # for links only analyse the first 10 minutes
+LINK_FULL_BELOW_MB = 300       # links below this size are downloaded whole
+LINK_STEPS = (300, 900)        # links above it: analyse this much audio
 
 
 async def _render_all_tracks(
     message, reply_msg, path, mi_json, fp_json, display_name,
     max_seconds=None, note="",
 ):
-    """Extract every audio track and render a SoX spectrogram for each."""
+    """
+    Extract every audio track as mono PCM and render a spek-style spectrogram
+    of the whole track for each.
+    """
     tracks = list_audio_tracks(fp_json, mi_json)
     if not tracks:
         await safe_edit(reply_msg, "❌ No audio track found in this file.")
@@ -68,8 +75,13 @@ async def _render_all_tracks(
         track_desc = spek_track_description(
             track, stream_number=position, stream_total=total)
 
+        # the extracted mono WAV may be shorter than the track when the file
+        # was only partially downloaded; its own length is the honest axis end
+        axis_seconds = _wav_duration(wav_path)
+
         if await build_spectrogram(wav_path, png_path, title=title,
-                                   desc=track_desc, version=SPEK_VERSION):
+                                   desc=track_desc, version=SPEK_VERSION,
+                                   duration=axis_seconds):
             caption = (
                 f"🎵 **Audio #{position}/{total}** — {description}\n"
                 f"**File:** `{display_name}`"
@@ -84,6 +96,20 @@ async def _render_all_tracks(
             pass
 
     return items
+
+
+def _wav_duration(wav_path):
+    """Length of a (mono PCM) WAV file in seconds, or None."""
+    import wave
+
+    try:
+        with wave.open(wav_path, "rb") as handle:
+            rate = handle.getframerate()
+            if rate:
+                return handle.getnframes() / float(rate)
+    except (wave.Error, OSError, ValueError):
+        pass
+    return None
 
 
 async def spek_telegram(client, media_message):
@@ -101,10 +127,10 @@ async def spek_telegram(client, media_message):
     path = None
     png_paths = []
     try:
-        # audio files are small -> downloaded fully; videos are streamed
-        # partially (head only) and every audio track inside is rendered
+        # audio and video files are downloaded in full: the spectrogram is
+        # only useful when it covers the whole audio track
         path, mi_json, fp_json, downloaded = await telegram_head_download(
-            client, media_message, reply_msg, display_name, full_below_mb=100)
+            client, media_message, reply_msg, display_name, full=True)
 
         items = await _render_all_tracks(
             media_message, reply_msg, path, mi_json, fp_json, display_name)
@@ -128,7 +154,7 @@ async def spek_telegram(client, media_message):
 
 
 async def spek_link(message, url):
-    """Spectrograms from a direct link (partial download, first minutes)."""
+    """Spectrograms from a direct link (whole file when it is not huge)."""
     reply_msg = await message.reply_text(
         "🎵 **Generating spectrogram(s)**, please wait ...", quote=True)
     path = None
@@ -138,20 +164,22 @@ async def spek_link(message, url):
         display_name = filename[:100]
 
         path, mi_json, fp_json, total_size = await http_head_download(
-            url, reply_msg, display_name, steps=(30, 120))
+            url, reply_msg, display_name, steps=LINK_STEPS,
+            full_below_mb=LINK_FULL_BELOW_MB)
 
         duration = get_duration_seconds(mi_json, fp_json)
         covered = covered_duration(duration, os.path.getsize(path), total_size)
 
-        max_seconds = LINK_ANALYSIS_SECONDS
-        note = "⚡ *Analysed the first 10 minutes (partial download).*"
-        if covered and covered < LINK_ANALYSIS_SECONDS:
-            note = (f"⚡ *Partial download — covers roughly the first "
-                    f"{get_readable_time(covered).strip()}.*")
+        # the time axis always shows the real track duration, so when only part
+        # of a large remote file was fetched, which part is covered is noted
+        note = ""
+        if covered and duration and covered < duration:
+            note = (f"⚡ *Partial download — the first "
+                    f"{get_readable_time(covered).strip()} of "
+                    f"{get_readable_time(duration).strip()} are shown.*")
 
         items = await _render_all_tracks(
-            message, reply_msg, path, mi_json, fp_json, display_name,
-            max_seconds=max_seconds, note=note)
+            message, reply_msg, path, mi_json, fp_json, display_name, note=note)
         if not items:
             return
 
@@ -176,10 +204,12 @@ async def spek_link(message, url):
 async def generate_spek(client, message: Message):
     usage = (
         "**Generates audio spectrograms (spek 0.8.5 / SoX style).**\n\n"
-        "• Reply to an **audio** file → spectrogram of the full audio\n"
-        "• Reply to a **video** file → one spectrogram for **each** audio track\n"
+        "• Reply to an **audio** or **video** file → spectrogram of the "
+        "**whole** audio track, one per audio track\n"
         "• Or pass a link: `/spek https://example.com/video.mkv` "
-        "(first 10 minutes analysed, whole file is never downloaded)"
+        "(downloaded fully unless the file is huge)\n\n"
+        "The time axis is marked every 5 minutes and ends at the real track "
+        "length (a 2 h 43 min track ends at `163:00`)."
     )
 
     if message.reply_to_message:

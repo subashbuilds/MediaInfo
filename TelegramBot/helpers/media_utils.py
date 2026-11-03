@@ -265,18 +265,20 @@ def covered_duration(duration, downloaded, total_size):
 
 async def telegram_head_download(
     client, media_message, reply_msg, display_name="media",
-    steps=None, full_below_mb=100, probe=True,
+    steps=None, full_below_mb=100, probe=True, full=False,
 ):
     """
     Download the head of a Telegram file in growing stages, re-parsing after
     every stage. Files smaller than `full_below_mb` are fetched in full.
+    `full=True` forces the complete file (used by /spek, which needs the whole
+    audio track and not just the first minutes).
     Returns (path, mi_json, fp_json, downloaded_bytes).
     """
     media = get_media(media_message)
     file_size = getattr(media, "file_size", 0) or 0
     path = os.path.join(DOWNLOAD_DIR, f"{randstr()}_{safe_filename(display_name)}")
 
-    if file_size and file_size <= full_below_mb * MB:
+    if file_size and (full or file_size <= full_below_mb * MB):
         stages = [math.ceil(file_size / MB) + 2]
     else:
         stages = list(steps or TELEGRAM_PROBE_STEPS)
@@ -315,10 +317,15 @@ async def telegram_head_download(
 
 async def http_head_download(
     url, reply_msg, display_name="media", steps=None, headers=None,
+    full_below_mb=None,
 ):
     """
     Download the head of a remote file with HTTP Range requests, re-parsing
     after every stage. Returns (path, mi_json, fp_json, total_size_or_None).
+
+    `full_below_mb` raises the first stage to the server's whole file size when
+    that size is below the given limit (used by /spek, which needs the entire
+    audio track), so small files are fetched in one go.
     """
     path = os.path.join(DOWNLOAD_DIR, f"{randstr()}_{safe_filename(display_name)}")
     request_headers = {"user-agent": DEFAULT_UA, "accept-encoding": "identity"}
@@ -335,6 +342,10 @@ async def http_head_download(
         headers=request_headers,
     ) as client:
         for stage, limit_mb in enumerate(stages, 1):
+            if stage == 1 and total_size and full_below_mb:
+                if total_size <= full_below_mb * MB:
+                    limit_mb = math.ceil(total_size / MB) + 1
+
             await safe_edit(
                 reply_msg,
                 f"⬇️ **Downloading** `{display_name}` — stage {stage}/{len(stages)} "
@@ -497,36 +508,46 @@ def describe_audio_track(track):
 async def extract_audio_track(src_path, stream_index, out_wav, max_seconds=None):
     """
     Extract one audio track (by audio-relative index) as 48 kHz MONO PCM.
-    Mono matters: SoX draws one spectrogram pane PER CHANNEL, so a stereo
-    wav would show a double graph for a single audio track.
-    `max_seconds` limits how much of the input is decoded.
+    Mono matters for two reasons: every channel is downmixed into one graph
+    (SoX draws one pane PER CHANNEL, so a stereo/5.1 wav would show a double
+    graph for a single audio track), and the output stays small enough to
+    process and upload. `max_seconds` limits how much of the input is decoded.
     """
     if not os.path.exists(src_path):
         return False
 
-    args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+    base_args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
     if max_seconds:
-        args += ["-t", str(int(max_seconds))]
-    args += [
-        "-i", src_path,
-        "-map", f"0:a:{stream_index}",
-        "-vn", "-sn", "-dn",
-        "-ac", "1", "-ar", "48000",
-        "-c:a", "pcm_s16le",
-        out_wav,
-    ]
+        base_args += ["-t", str(int(max_seconds))]
+    base_args += ["-i", src_path, "-map", f"0:a:{stream_index}",
+                  "-vn", "-sn", "-dn"]
+    tail_args = ["-ar", "48000", "-c:a", "pcm_s16le", out_wav]
 
-    try:
-        code, output = await run_process(args, timeout_seconds=900)
-    except asyncio.TimeoutError:
-        logger.error(f"audio extraction timed out for track {stream_index}")
-        cleanup_paths(out_wav)
-        return False
+    # `-ac 1` uses ffmpeg's default downmix; `-af pan` names the channels
+    # explicitly as a fallback for layouts ffmpeg refuses to downmix on its own.
+    downmixes = (
+        ["-ac", "1"],
+        ["-af", "pan=mono|c0=0.5*c0+0.5*c1"],
+        ["-ac", "1", "-af", "aresample=48000"],
+    )
 
-    if code != 0:
-        logger.error(
-            f"audio extraction failed for track {stream_index}: {output[:300]}")
-    return code == 0 and os.path.exists(out_wav) and os.path.getsize(out_wav) > 1024
+    for downmix in downmixes:
+        try:
+            code, output = await run_process(
+                base_args + downmix + tail_args, timeout_seconds=900)
+        except asyncio.TimeoutError:
+            logger.error(f"audio extraction timed out for track {stream_index}")
+            cleanup_paths(out_wav)
+            return False
+
+        if code == 0 and os.path.exists(out_wav) and os.path.getsize(out_wav) > 1024:
+            return True
+        logger.warning(
+            f"mono extraction of track {stream_index} failed with "
+            f"{downmix}: {output[:200]}")
+
+    logger.error(f"audio extraction failed for track {stream_index}")
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -556,10 +577,29 @@ SPEK_PLOT_TOP = 42              # top margin (file name + stream info)
 SPEK_PLOT_BOTTOM = 36           # bottom margin (time labels)
 SPEK_LEGEND_WIDTH = 14          # width of the colour legend strip
 SPEK_DB_RANGE = 120             # dynamic range of the legend, in dB
+SPEK_TIME_STEP = 300            # seconds between time-axis ticks (5 minutes)
 SPEK_FREQ_MIRROR = False        # flip vertically if the graph is upside down
 # SoX is much faster when the plot height is 1 + 2**n (power-of-two DFT);
 # 1025 gives a 2048-point DFT and is scaled to the canvas height afterwards.
 SPEK_SOX_Y = 1025
+
+# Minimum horizontal room for one 5-minute time tick, and a sanity cap so a
+# very long recording cannot ask for an enormous image.
+SPEK_MIN_TICK_PX = 58
+SPEK_MAX_PLOT_PX = 6000
+
+
+def _spek_plot_size(duration):
+    """
+    Plot area (width, height) in pixels. The height is fixed; the width grows
+    with the duration so the 5-minute time ticks stay readable on long tracks.
+    """
+    plot_h = SPEK_HEIGHT - SPEK_PLOT_TOP - SPEK_PLOT_BOTTOM
+    plot_w = SPEK_WIDTH - SPEK_PLOT_LEFT - SPEK_PLOT_RIGHT
+    if duration and duration > 0:
+        ticks = int(duration // SPEK_TIME_STEP) + 2
+        plot_w = min(SPEK_MAX_PLOT_PX, max(plot_w, ticks * SPEK_MIN_TICK_PX))
+    return plot_w, plot_h
 
 
 def _spek_sox_rgb(level):
@@ -620,7 +660,7 @@ def _format_time(seconds):
 
 def spek_track_description(track, sox_y=SPEK_SOX_Y, window="Hann",
                            stream_number=None, stream_total=None):
-    """`Stream 1 / 1: ATSC A/52A (AC-3), 640 kbps, 48000 Hz, channel 1 / 6, W:2048, F:Hann`."""
+    """`Stream 1 / 1: E-AC-3, 640 kbps, 48000 Hz, mono (6 ch downmix), W:2048, F:Hann`."""
     parts = [str(track.get("codec") or "Audio")]
 
     bit_rate = track.get("bit_rate")
@@ -639,9 +679,17 @@ def spek_track_description(track, sox_y=SPEK_SOX_Y, window="Hann",
         except (TypeError, ValueError):
             pass
 
+    # the spectrogram is always rendered from a mono downmix, so the header
+    # says mono and only mentions the source channel count
     channels = track.get("channels")
-    if channels:
-        parts.append(f"channel 1 / {channels}")
+    try:
+        channels = int(channels) if channels else 0
+    except (TypeError, ValueError):
+        channels = 0
+    if channels > 1:
+        parts.append(f"mono ({channels} ch downmix)")
+    else:
+        parts.append("mono")
 
     parts.append(f"W:{2 * (sox_y - 1)}")
     parts.append(f"F:{window}")
@@ -697,11 +745,10 @@ def _draw_spectrogram_canvas(plot, title, desc, sample_rate, duration, version):
     """Compose the plot with the spek-style header, axes and dB legend."""
     from PIL import Image, ImageDraw
 
-    width, height = SPEK_WIDTH, SPEK_HEIGHT
+    plot_w, plot_h = _spek_plot_size(duration)
     left, top = SPEK_PLOT_LEFT, SPEK_PLOT_TOP
-    right, bottom = SPEK_PLOT_RIGHT, SPEK_PLOT_BOTTOM
-    plot_w = max(1, width - left - right)
-    plot_h = max(1, height - top - bottom)
+    width = plot_w + left + SPEK_PLOT_RIGHT
+    height = plot_h + top + SPEK_PLOT_BOTTOM
 
     transpose = getattr(getattr(Image, "Transpose", Image), "FLIP_TOP_BOTTOM")
     if SPEK_FREQ_MIRROR:
@@ -734,9 +781,10 @@ def _draw_spectrogram_canvas(plot, title, desc, sample_rate, duration, version):
                       font=font_small, fill=(255, 255, 255))
             value += step
 
-    # Time axis (bottom, mm:ss).
+    # Time axis (bottom): a tick every 5 minutes, with the true end of the
+    # audio as the final label (a 2:43:00 track ends at "163:00").
     if duration and duration > 0:
-        step = _nice_step(duration, target=10)
+        step = SPEK_TIME_STEP
         value = 0.0
         while value <= duration + 1e-9:
             x = left + (value / duration) * plot_w
@@ -748,8 +796,16 @@ def _draw_spectrogram_canvas(plot, title, desc, sample_rate, duration, version):
                       font=font_small, fill=(255, 255, 255))
             value += step
 
+        x = left + plot_w
+        draw.line([x, top + plot_h + 1, x, top + plot_h + 5],
+                  fill=(255, 255, 255))
+        label = _format_time(duration)
+        label_width = draw.textlength(label, font=font_small)
+        draw.text((x - label_width / 2, top + plot_h + 8), label,
+                  font=font_small, fill=(255, 255, 255))
+
     # Colour legend (right strip) with dB labels.
-    legend_x = width - right + 4
+    legend_x = plot_w + left + 4
     strip = Image.new("RGB", (SPEK_LEGEND_WIDTH, plot_h), (0, 0, 0))
     pixels = strip.load()
     for y in range(plot_h):
@@ -783,8 +839,14 @@ def _draw_spectrogram_canvas(plot, title, desc, sample_rate, duration, version):
     return canvas
 
 
-async def _sox_raw_spectrogram(wav_path, columns, rows_value):
-    """Run SoX with `-r` (no axes/legends) and return the raw PNG path."""
+async def _sox_raw_spectrogram(wav_path, columns, rows_value, duration=None):
+    """
+    Run SoX with `-r` (no axes/legends) and return the raw PNG path.
+
+    SoX derives the time axis of the finished image from the decoded signal; a
+    partially read / odd-length input can make it disagree with the WAV header,
+    which would skew every time tick, so `-d` pins the duration when known.
+    """
     png_path = f"{wav_path}.raw.png"
     args = [
         "sox", wav_path, "-n", "spectrogram",
@@ -792,6 +854,8 @@ async def _sox_raw_spectrogram(wav_path, columns, rows_value):
         "-z", str(SPEK_DB_RANGE), "-w", "Kaiser",
         "-r", "-o", png_path,
     ]
+    if duration and duration > 0:
+        args += ["-d", f"{duration:.3f}"]
     try:
         code, output = await run_process(args, timeout_seconds=900)
     except asyncio.TimeoutError:
@@ -806,7 +870,8 @@ async def _sox_raw_spectrogram(wav_path, columns, rows_value):
     return png_path
 
 
-async def _render_spek_spectrogram(wav_path, png_path, title, desc, version):
+async def _render_spek_spectrogram(wav_path, png_path, title, desc, version,
+                                   duration=None):
     """Render the spek-style image; returns True on success."""
     try:
         from PIL import Image
@@ -815,18 +880,19 @@ async def _render_spek_spectrogram(wav_path, png_path, title, desc, version):
 
     import wave
 
-    sample_rate = duration = None
+    sample_rate = None
     try:
         with wave.open(wav_path, "rb") as handle:
             sample_rate = handle.getframerate() or None
-            frames = handle.getnframes()
-            if sample_rate:
-                duration = frames / float(sample_rate)
+            if not duration:
+                frames = handle.getnframes()
+                if sample_rate:
+                    duration = frames / float(sample_rate)
     except (wave.Error, OSError, ValueError):
         pass
 
-    plot_w = SPEK_WIDTH - SPEK_PLOT_LEFT - SPEK_PLOT_RIGHT
-    raw_path = await _sox_raw_spectrogram(wav_path, plot_w, SPEK_SOX_Y)
+    plot_w, _ = _spek_plot_size(duration)
+    raw_path = await _sox_raw_spectrogram(wav_path, plot_w, SPEK_SOX_Y, duration)
     if raw_path is None:
         return False
 
@@ -871,17 +937,21 @@ async def _render_plain_sox_spectrogram(wav_path, png_path, title, comment):
 
 
 async def build_spectrogram(wav_path, png_path, title="", desc="",
-                            version=SPEK_VERSION):
+                            version=SPEK_VERSION, duration=None):
     """
     Render a spek-style spectrogram: dark background, SoX heat palette, a
-    header with the file name and stream info, kHz frequency axis, mm:ss time
-    axis and a dB colour legend. Falls back to a plain SoX image (its own
-    legend) when Pillow is not installed.
+    header with the file name and stream info, kHz frequency axis, a 5-minute
+    time axis ending at the real track length, and a dB colour legend. Falls
+    back to a plain SoX image (its own legend) when Pillow is not installed.
+
+    `duration` is the track length in seconds; it defaults to the length of the
+    WAV file.
     """
     if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1024:
         return False
 
-    if await _render_spek_spectrogram(wav_path, png_path, title, desc, version):
+    if await _render_spek_spectrogram(wav_path, png_path, title, desc, version,
+                                      duration=duration):
         return True
 
     logger.warning("spek-style rendering unavailable — using plain SoX output")
