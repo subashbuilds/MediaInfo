@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y \
     sox \
     libsox-fmt-mp3 \
     mediainfo \
+    fonts-dejavu-core \
     locales \
     megatools \
   && rm -rf /var/lib/apt/lists/*

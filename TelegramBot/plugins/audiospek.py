@@ -23,6 +23,7 @@ from TelegramBot.helpers.media_utils import (
     URL_REGEX, get_media, get_duration_seconds, covered_duration,
     telegram_head_download, http_head_download, list_audio_tracks,
     describe_audio_track, extract_audio_track, build_spectrogram,
+    spek_track_description, SPEK_VERSION,
     send_spectrogram_album, cleanup_paths, safe_edit)
 from TelegramBot.logging import LOGGER
 
@@ -64,8 +65,11 @@ async def _render_all_tracks(
 
         png_path = os.path.join("download", f"{randstr()}_track{position}.png")
         title = f"{display_name[:60]} — Audio #{position}"
+        track_desc = spek_track_description(
+            track, stream_number=position, stream_total=total)
 
-        if await build_spectrogram(wav_path, png_path, title=title, comment=description):
+        if await build_spectrogram(wav_path, png_path, title=title,
+                                   desc=track_desc, version=SPEK_VERSION):
             caption = (
                 f"🎵 **Audio #{position}/{total}** — {description}\n"
                 f"**File:** `{display_name}`"
@@ -171,7 +175,7 @@ async def spek_link(message, url):
 @Client.on_message(filters.command(["spek", "sox"]) & check_auth)
 async def generate_spek(client, message: Message):
     usage = (
-        "**Generates audio spectrograms (classic SoX style).**\n\n"
+        "**Generates audio spectrograms (spek 0.8.5 / SoX style).**\n\n"
         "• Reply to an **audio** file → spectrogram of the full audio\n"
         "• Reply to a **video** file → one spectrogram for **each** audio track\n"
         "• Or pass a link: `/spek https://example.com/video.mkv` "
