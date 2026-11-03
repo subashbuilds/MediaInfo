@@ -5,7 +5,8 @@ Shared media helpers used by every generation plugin:
     file is never fetched, the head is downloaded in growing stages and
     re-parsed after each stage
   * robust media probing through ffprobe / MediaInfo with guarded JSON parsing
-  * per-audio-track extraction and classic SoX spectrogram rendering
+  * per-audio-track extraction and spek-style spectrogram rendering (SoX DSP
+    with a redrawn spek 0.8.5 header/axes/dB legend)
 """
 
 import os
@@ -528,20 +529,328 @@ async def extract_audio_track(src_path, stream_index, out_wav, max_seconds=None)
     return code == 0 and os.path.exists(out_wav) and os.path.getsize(out_wav) > 1024
 
 
-async def build_spectrogram(wav_path, png_path, title="", comment=""):
-    """
-    Render a wide SoX spectrogram in the classic style: dark background,
-    vivid green→yellow→red heat colours, kHz and time axes, title on top and
-    the track description at the bottom.
-    """
-    if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1024:
-        return False
+# --------------------------------------------------------------------------- #
+#  Spectrogram rendering (spek 0.8.5 / classic SoX audio-viewer style)
+# --------------------------------------------------------------------------- #
+#
+# Layout reproduced (identical to the reference image):
+#
+#   file name (bold)                                   spek 0.8.5
+#   codec, bitrate, sample rate, channel, W:…, F:…           ┌────┐ 0 dB
+#    24 MHz ┤            spectrogram (SoX palette)       ╷   │    │
+#    22 MHz ┤                                            ╵   │    │
+#     0 MHz └──┬────┬────┬────┬────┬────┬────┬────┬──────────┘ −120 dB
+#             0:00 0:30 1:00 1:30 2:00 2:30 3:00 3:30
+#
+# SoX does the actual DSP (DFT, block averaging, dB conversion and colouring);
+# this module only redraws the image with the spek-style header, kHz/mm:ss axes
+# and dB colour legend around the raw spectrogram, which is why the palette
+# matches the reference exactly.
 
+SPEK_VERSION = "0.8.5"          # version shown at the top-right of the image
+SPEK_WIDTH = 1568               # output image width in pixels
+SPEK_HEIGHT = 780               # output image height in pixels
+SPEK_PLOT_LEFT = 72             # left margin (frequency labels)
+SPEK_PLOT_RIGHT = 84            # right margin (palette legend + dB labels)
+SPEK_PLOT_TOP = 42              # top margin (file name + stream info)
+SPEK_PLOT_BOTTOM = 36           # bottom margin (time labels)
+SPEK_LEGEND_WIDTH = 14          # width of the colour legend strip
+SPEK_DB_RANGE = 120             # dynamic range of the legend, in dB
+SPEK_FREQ_MIRROR = False        # flip vertically if the graph is upside down
+# SoX is much faster when the plot height is 1 + 2**n (power-of-two DFT);
+# 1025 gives a 2048-point DFT and is scaled to the canvas height afterwards.
+SPEK_SOX_Y = 1025
+
+
+def _spek_sox_rgb(level):
+    """
+    SoX's default heat palette (identical to spek's ``sox`` palette):
+    black → blue → purple → red → orange → yellow → white.
+    """
+    level = min(1.0, max(0.0, float(level)))
+
+    if level < 0.13:
+        red = 0.0
+    elif level < 0.73:
+        red = math.sin((level - 0.13) / 0.60 * math.pi / 2.0)
+    else:
+        red = 1.0
+
+    if level < 0.60:
+        green = 0.0
+    elif level < 0.91:
+        green = math.sin((level - 0.60) / 0.31 * math.pi / 2.0)
+    else:
+        green = 1.0
+
+    if level < 0.60:
+        blue = 0.5 * math.sin(level / 0.60 * math.pi)
+    elif level < 0.78:
+        blue = 0.0
+    else:
+        blue = (level - 0.78) / 0.22
+
+    return int(red * 255 + 0.5), int(green * 255 + 0.5), int(blue * 255 + 0.5)
+
+
+def _nice_step(span, target=12):
+    """A 1/2/2.5/5/10 times a power of ten axis step giving ~`target` ticks."""
+    if span <= 0 or target <= 0:
+        return 1.0
+    raw = span / float(target)
+    magnitude = 10 ** math.floor(math.log10(raw))
+    for factor in (1, 2, 2.5, 5, 10):
+        if magnitude * factor >= raw - 1e-12:
+            return magnitude * factor
+    return magnitude * 10
+
+
+def _format_freq(hertz):
+    if hertz >= 1e6:
+        return f"{hertz / 1e6:.6g} MHz"
+    if hertz >= 1e3:
+        return f"{hertz / 1e3:.6g} kHz"
+    return f"{hertz:.6g} Hz"
+
+
+def _format_time(seconds):
+    total = max(0, int(round(seconds)))
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def spek_track_description(track, sox_y=SPEK_SOX_Y, window="Hann",
+                           stream_number=None, stream_total=None):
+    """`Stream 1 / 1: ATSC A/52A (AC-3), 640 kbps, 48000 Hz, channel 1 / 6, W:2048, F:Hann`."""
+    parts = [str(track.get("codec") or "Audio")]
+
+    bit_rate = track.get("bit_rate")
+    if bit_rate:
+        try:
+            kbps = int(float(str(bit_rate).replace(",", "")) / 1000)
+            if kbps > 0:
+                parts.append(f"{kbps} kbps")
+        except (TypeError, ValueError):
+            pass
+
+    sample_rate = track.get("sample_rate")
+    if sample_rate:
+        try:
+            parts.append(f"{int(sample_rate)} Hz")
+        except (TypeError, ValueError):
+            pass
+
+    channels = track.get("channels")
+    if channels:
+        parts.append(f"channel 1 / {channels}")
+
+    parts.append(f"W:{2 * (sox_y - 1)}")
+    parts.append(f"F:{window}")
+
+    description = ", ".join(parts)
+    if stream_number and stream_total:
+        description = f"Stream {stream_number} / {stream_total}: {description}"
+    return description
+
+
+def _load_font(size, bold=False):
+    """Best-effort font lookup (falls back to Pillow's built-in bitmap font)."""
+    from PIL import ImageFont
+
+    paths = []
+    if bold:
+        paths.append("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+    paths += [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ]
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _fit_text(draw, text, font, max_width):
+    """Truncate `text` with an ellipsis so it fits inside `max_width` pixels."""
+    if max_width <= 0:
+        return ""
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+
+    ellipsis = "…"
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if draw.textlength(text[:mid] + ellipsis, font=font) <= max_width:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low] + ellipsis
+
+
+def _draw_spectrogram_canvas(plot, title, desc, sample_rate, duration, version):
+    """Compose the plot with the spek-style header, axes and dB legend."""
+    from PIL import Image, ImageDraw
+
+    width, height = SPEK_WIDTH, SPEK_HEIGHT
+    left, top = SPEK_PLOT_LEFT, SPEK_PLOT_TOP
+    right, bottom = SPEK_PLOT_RIGHT, SPEK_PLOT_BOTTOM
+    plot_w = max(1, width - left - right)
+    plot_h = max(1, height - top - bottom)
+
+    transpose = getattr(getattr(Image, "Transpose", Image), "FLIP_TOP_BOTTOM")
+    if SPEK_FREQ_MIRROR:
+        plot = plot.transpose(transpose)
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    plot = plot.resize((plot_w, plot_h), resample)
+
+    canvas = Image.new("RGB", (width, height), (0, 0, 0))
+    canvas.paste(plot, (left, top))
+    draw = ImageDraw.Draw(canvas)
+
+    font_small = _load_font(11)
+    font_bold = _load_font(16, bold=True)
+
+    draw.rectangle(
+        [left - 1, top - 1, left + plot_w, top + plot_h],
+        outline=(255, 255, 255))
+
+    # Frequency axis (left, increasing upwards).
+    nyquist = (sample_rate or 0) / 2.0
+    if nyquist > 0:
+        step = _nice_step(nyquist, target=12)
+        value = 0.0
+        while value <= nyquist + 1e-9:
+            y = top + plot_h - (value / nyquist) * plot_h
+            draw.line([left - 5, y, left - 1, y], fill=(255, 255, 255))
+            label = _format_freq(value)
+            label_width = draw.textlength(label, font=font_small)
+            draw.text((left - 9 - label_width, y - 6), label,
+                      font=font_small, fill=(255, 255, 255))
+            value += step
+
+    # Time axis (bottom, mm:ss).
+    if duration and duration > 0:
+        step = _nice_step(duration, target=10)
+        value = 0.0
+        while value <= duration + 1e-9:
+            x = left + (value / duration) * plot_w
+            draw.line([x, top + plot_h + 1, x, top + plot_h + 5],
+                      fill=(255, 255, 255))
+            label = _format_time(value)
+            label_width = draw.textlength(label, font=font_small)
+            draw.text((x - label_width / 2, top + plot_h + 8), label,
+                      font=font_small, fill=(255, 255, 255))
+            value += step
+
+    # Colour legend (right strip) with dB labels.
+    legend_x = width - right + 4
+    strip = Image.new("RGB", (SPEK_LEGEND_WIDTH, plot_h), (0, 0, 0))
+    pixels = strip.load()
+    for y in range(plot_h):
+        colour = _spek_sox_rgb(1.0 - y / max(1, plot_h - 1))
+        for x in range(SPEK_LEGEND_WIDTH):
+            pixels[x, y] = colour
+    canvas.paste(strip, (legend_x, top))
+    draw.rectangle(
+        [legend_x - 1, top - 1, legend_x + SPEK_LEGEND_WIDTH, top + plot_h],
+        outline=(255, 255, 255))
+
+    step = _nice_step(SPEK_DB_RANGE, target=12)
+    db = 0.0
+    while db >= -SPEK_DB_RANGE - 1e-9:
+        y = top + (-db / SPEK_DB_RANGE) * plot_h
+        draw.text((legend_x + SPEK_LEGEND_WIDTH + 5, y - 6),
+                  f"{int(round(db))} dB", font=font_small, fill=(255, 255, 255))
+        db -= step
+
+    # Header: file name (bold) + stream info on the left, version on the right.
+    draw.text((left, 3), _fit_text(draw, title, font_bold, plot_w),
+              font=font_bold, fill=(255, 255, 255))
+    if desc:
+        draw.text((left, top - 19), _fit_text(draw, desc, font_small, plot_w),
+                  font=font_small, fill=(255, 255, 255))
+    version_text = f"spek {version}"
+    version_width = draw.textlength(version_text, font=font_bold)
+    draw.text((width - right - version_width, 3), version_text,
+              font=font_bold, fill=(255, 255, 255))
+
+    return canvas
+
+
+async def _sox_raw_spectrogram(wav_path, columns, rows_value):
+    """Run SoX with `-r` (no axes/legends) and return the raw PNG path."""
+    png_path = f"{wav_path}.raw.png"
     args = [
         "sox", wav_path, "-n", "spectrogram",
-        "-x", "2400", "-y", "900",   # large, sharp output image
-        "-z", "120",                 # dynamic range in dB
-        "-w", "Kaiser",              # window function
+        "-x", str(columns), "-y", str(rows_value),
+        "-z", str(SPEK_DB_RANGE), "-w", "Kaiser",
+        "-r", "-o", png_path,
+    ]
+    try:
+        code, output = await run_process(args, timeout_seconds=900)
+    except asyncio.TimeoutError:
+        logger.error("sox spectrogram (raw pass) timed out")
+        cleanup_paths(png_path)
+        return None
+
+    if code != 0 or not os.path.exists(png_path) or os.path.getsize(png_path) == 0:
+        logger.error(f"sox spectrogram (raw pass) failed: {output[:300]}")
+        cleanup_paths(png_path)
+        return None
+    return png_path
+
+
+async def _render_spek_spectrogram(wav_path, png_path, title, desc, version):
+    """Render the spek-style image; returns True on success."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+
+    import wave
+
+    sample_rate = duration = None
+    try:
+        with wave.open(wav_path, "rb") as handle:
+            sample_rate = handle.getframerate() or None
+            frames = handle.getnframes()
+            if sample_rate:
+                duration = frames / float(sample_rate)
+    except (wave.Error, OSError, ValueError):
+        pass
+
+    plot_w = SPEK_WIDTH - SPEK_PLOT_LEFT - SPEK_PLOT_RIGHT
+    raw_path = await _sox_raw_spectrogram(wav_path, plot_w, SPEK_SOX_Y)
+    if raw_path is None:
+        return False
+
+    try:
+        with Image.open(raw_path) as image:
+            plot = image.convert("RGB")
+        canvas = _draw_spectrogram_canvas(
+            plot, title, desc, sample_rate, duration, version)
+        canvas.save(png_path, "PNG", optimize=True)
+    except Exception as error:
+        logger.error(f"could not compose the spectrogram image: {error}")
+        cleanup_paths(raw_path)
+        return False
+
+    cleanup_paths(raw_path)
+    return os.path.exists(png_path) and os.path.getsize(png_path) > 0
+
+
+async def _render_plain_sox_spectrogram(wav_path, png_path, title, comment):
+    """Plain SoX spectrogram — fallback used when Pillow is unavailable."""
+    args = [
+        "sox", wav_path, "-n", "spectrogram",
+        "-x", "1600", "-y", "900",
+        "-z", str(SPEK_DB_RANGE), "-w", "Kaiser",
         "-o", png_path,
     ]
     if title:
@@ -559,6 +868,24 @@ async def build_spectrogram(wav_path, png_path, title="", comment=""):
         logger.error(f"sox spectrogram failed: {output[:300]}")
         return False
     return True
+
+
+async def build_spectrogram(wav_path, png_path, title="", desc="",
+                            version=SPEK_VERSION):
+    """
+    Render a spek-style spectrogram: dark background, SoX heat palette, a
+    header with the file name and stream info, kHz frequency axis, mm:ss time
+    axis and a dB colour legend. Falls back to a plain SoX image (its own
+    legend) when Pillow is not installed.
+    """
+    if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1024:
+        return False
+
+    if await _render_spek_spectrogram(wav_path, png_path, title, desc, version):
+        return True
+
+    logger.warning("spek-style rendering unavailable — using plain SoX output")
+    return await _render_plain_sox_spectrogram(wav_path, png_path, title, desc)
 
 
 async def send_spectrogram_album(message, items):

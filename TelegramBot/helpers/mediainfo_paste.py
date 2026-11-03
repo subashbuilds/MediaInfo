@@ -1,9 +1,20 @@
 import html
 import re
+
 from telegraph import Telegraph
+
 from TelegramBot.config import TELEGRAPH_TOKEN
 
-telegraph = Telegraph(access_token=TELEGRAPH_TOKEN)
+# A Telegraph access token only works on the domain that issued it (either
+# api.telegra.ph or api.graph.org). Posting a token to the wrong domain fails
+# with ACCESS_TOKEN_INVALID, and — more importantly — a page created on one
+# domain is not served by the other, so the shared link 404s.
+#
+# graph.org is used first because telegra.ph is blocked/unreachable on a lot of
+# networks (and the bot's bundled token was issued by graph.org); telegra.ph is
+# kept as a fallback for the opposite situation.
+TELEGRAPH_DOMAINS = ("graph.org", "telegra.ph")
+
 
 def html_builder(title: str, text: str):
     page = f"<b>🎬 {html.escape(title)}</b><br><br>"
@@ -66,11 +77,29 @@ def html_builder(title: str, text: str):
 
 
 def mediainfo_paste(text: str, title: str):
+    """
+    Post the detailed MediaInfo text to Telegra.ph and return the page URL
+    (or None when no token is configured). The page is created on the same
+    domain the token belongs to, otherwise the returned link would 404.
+    """
+    if not TELEGRAPH_TOKEN:
+        return None
+
     html_content = html_builder(title, text)
 
-    response = telegraph.create_page(
-        title=title[:256],
-        html_content=html_content
-    )
+    last_error = None
+    for domain in TELEGRAPH_DOMAINS:
+        try:
+            telegraph = Telegraph(access_token=TELEGRAPH_TOKEN, domain=domain)
+            response = telegraph.create_page(
+                title=title[:256],
+                html_content=html_content,
+            )
+            return response["url"]
+        except Exception as error:  # ACCESS_TOKEN_INVALID, network error, ...
+            last_error = error
+            continue
 
-    return response["url"]
+    if last_error is not None:
+        raise last_error
+    return None

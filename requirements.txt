@@ -16,3 +16,4 @@ httpx
 bs4
 python-dotenv
 tzdata
+Pillow

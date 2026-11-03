@@ -9,8 +9,9 @@ after each stage, which is what makes Mediainfo succeed on the FIRST attempt.
 
 import os
 import re
+import httpx
 import traceback
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -306,6 +307,31 @@ def build_summary(mi_json, display_name, real_size=None, partial=False):
     return summary
 
 
+async def _resolve_paste_url(url, timeout=15.0):
+    """
+    Follow a Telegraph page URL to the page it actually redirects to.
+
+    Some shared links redirect (e.g. a telegra.ph path that is served from
+    graph.org, or vice versa); posting the redirect target avoids a "404 not
+    found" when the user opens the link. On any error the original URL is
+    returned unchanged.
+    """
+    if not url:
+        return url
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(timeout),
+            headers={"user-agent": "Mozilla/5.0"},
+        ) as client:
+            response = await client.get(url)
+        if response.status_code == 200 and str(response.url) != url:
+            return str(response.url)
+    except (httpx.HTTPError, Exception):
+        pass
+    return url
+
+
 async def _send_result(
     reply_msg, target_message, path, text, mi_json, display_name, real_size,
     isRaw, partial=False
@@ -338,8 +364,10 @@ async def _send_result(
         logger.error(f"telegraph paste failed: {error}")
 
     if paste_url:
+        paste_url = await _resolve_paste_url(paste_url)
         await reply_msg.edit(
-            f"{summary}\n\n📝 **Full detailed MediaInfo:** {paste_url}",
+            f"{summary}\n\n📝 **Full detailed MediaInfo:** "
+            f"[{display_name}]({paste_url})",
             disable_web_page_preview=True)
     else:
         # Telegraph unreachable -> fall back to a text document
