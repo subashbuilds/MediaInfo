@@ -53,6 +53,7 @@ async def _render_all_tracks(
     tracks = tracks[:MAX_TRACKS]
     total = len(tracks)
     items = []
+    failures = []
 
     for track in tracks:
         position = track["position"]
@@ -62,38 +63,54 @@ async def _render_all_tracks(
             reply_msg, f"🎵 **Extracting audio track {position}/{total}** ...")
 
         wav_path = os.path.join("download", f"{randstr()}_track{position}.wav")
-        if not await extract_audio_track(path, track["stream_index"], wav_path,
-                                         max_seconds=max_seconds):
-            logger.error(f"could not extract audio track {position} of {display_name}")
-            continue
-
-        await safe_edit(
-            reply_msg, f"📊 **Rendering spectrogram {position}/{total}** ...")
-
         png_path = os.path.join("download", f"{randstr()}_track{position}.png")
-        title = f"{display_name[:60]} — Audio #{position}"
-        track_desc = spek_track_description(
-            track, stream_number=position, stream_total=total)
-
-        # the extracted mono WAV may be shorter than the track when the file
-        # was only partially downloaded; its own length is the honest axis end
-        axis_seconds = _wav_duration(wav_path)
-
-        if await build_spectrogram(wav_path, png_path, title=title,
-                                   desc=track_desc, version=SPEK_VERSION,
-                                   duration=axis_seconds):
-            caption = (
-                f"🎵 **Audio #{position}/{total}** — {description}\n"
-                f"**File:** `{display_name}`"
-            )
-            if note:
-                caption += f"\n{note}"
-            items.append((png_path, caption))
-
         try:
-            os.remove(wav_path)
-        except OSError:
-            pass
+            if not await extract_audio_track(path, track["stream_index"], wav_path,
+                                             max_seconds=max_seconds):
+                logger.error(
+                    f"could not extract audio track {position} of {display_name}")
+                failures.append(f"#{position} (extraction)")
+                continue
+
+            await safe_edit(
+                reply_msg, f"📊 **Rendering spectrogram {position}/{total}** ...")
+
+            title = f"{display_name[:60]} — Audio #{position}"
+            track_desc = spek_track_description(
+                track, stream_number=position, stream_total=total)
+
+            # the extracted mono WAV may be shorter than the track when the file
+            # was only partially downloaded; its own length is the honest axis end
+            axis_seconds = _wav_duration(wav_path)
+
+            if await build_spectrogram(wav_path, png_path, title=title,
+                                       desc=track_desc, version=SPEK_VERSION,
+                                       duration=axis_seconds):
+                caption = (
+                    f"🎵 **Audio #{position}/{total}** — {description}\n"
+                    f"**File:** `{display_name}`"
+                )
+                if note:
+                    caption += f"\n{note}"
+                items.append((png_path, caption))
+            else:
+                logger.error(
+                    f"spectrogram render failed for track {position} of {display_name}")
+                failures.append(f"#{position} (render)")
+        except Exception as error:
+            logger.error(f"track {position} of {display_name} failed: {error}")
+            failures.append(f"#{position}")
+        finally:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+
+    if not items and failures:
+        await safe_edit(
+            reply_msg,
+            "❌ Could not generate a spectrogram for track(s) "
+            f"{', '.join(failures)} — the track may be too long or corrupt.")
 
     return items
 

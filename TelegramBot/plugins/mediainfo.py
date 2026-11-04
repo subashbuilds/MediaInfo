@@ -9,6 +9,7 @@ after each stage, which is what makes Mediainfo succeed on the FIRST attempt.
 
 import os
 import re
+import json
 import httpx
 import traceback
 from urllib.parse import unquote, urljoin
@@ -27,6 +28,10 @@ from TelegramBot.helpers.gdrivehelper import GoogleDriveHelper
 from TelegramBot.logging import LOGGER
 
 logger = LOGGER(__name__)
+
+# seconds of the file scanned with ffprobe to measure each stream's bitrate
+# from its own packets (Matroska written by ffmpeg stores none of its own)
+SCAN_SECONDS = 120
 
 
 def _format_duration(seconds):
@@ -135,29 +140,31 @@ def _set_mi_value(line, value):
     return f"{prefix}: {value}"
 
 
-async def build_mediainfo(path, mi_json, display_name, real_size=None, partial=False):
+async def build_mediainfo(path, mi_json, display_name, real_size=None,
+                          partial=False, fp_json=None):
     """
     Run mediainfo in full-detail mode (`-f`, every known field) on the
     (partial) file and post-process the text:
 
       * restore the original file name (partial files get random names)
       * restore the real file size and real overall bitrate
-      * give every video / audio / text track a stream size (estimated from its
-        bitrate and marked `~` when only part of the file was read, or when
-        MediaInfo reports no stream size at all)
+      * give every video / audio / text track a stream size, marked `~`, taken
+        from the stream's own packets (measured) or its bitrate (estimated)
+        whenever MediaInfo does not print one itself
 
-    Returns (text, mi_json).
+    Returns (text, mi_json, sizes).
     """
     _, full_text = await run_process(["mediainfo", "-f", path])
     if not full_text.strip():
         _, full_text = await run_process(["mediainfo", path])
 
-    duration = get_duration_seconds(mi_json, None)
+    duration = get_duration_seconds(mi_json, fp_json)
 
     lines = full_text.splitlines()
     value_column = _mi_value_column(lines)
     size_prefix = "Stream size".ljust(value_column)
     sections = []        # (section_type, section_index, start_line, has_size)
+    rewrite_sizes = []   # (line_index, section_type, section_index) to rescale
     section_type = None
     section_index = 0
     for index, line in enumerate(lines):
@@ -202,12 +209,8 @@ async def build_mediainfo(path, mi_json, display_name, real_size=None, partial=F
         elif stripped.startswith("Stream size") and partial and section_type in (
                 "Video", "Audio", "Text") and duration:
             # only part of the file was read — MediaInfo's own stream size
-            # covers just the seen part, so replace it with the estimate
-            track = _mi_track(mi_json, section_type, section_index) or {}
-            estimate = _estimate_stream_size(track, duration)
-            if estimate:
-                lines[index] = _set_mi_value(
-                    line, "~" + get_readable_bytes(estimate))
+            # covers just the seen part, so it is rescaled below
+            rewrite_sizes.append((index, section_type, section_index))
             if sections:
                 sections[-1][3] = True
 
@@ -215,20 +218,53 @@ async def build_mediainfo(path, mi_json, display_name, real_size=None, partial=F
             sections[-1][3] = True
 
     # MediaInfo only prints a stream size for some containers, so a track
-    # without one gets an estimate from its bitrate (marked `~`), inserted as
-    # the first line under its header. Done last-first so earlier positions
-    # of the list stay valid.
-    if duration:
+    # without one gets a size measured from its own packets (falling back to a
+    # bitrate estimate), marked `~`. Files written by ffmpeg (Lavf) store no
+    # per-track bitrate in Matroska, so the packets are the only real source.
+    sizes = {}
+    pending = ([section for section in sections if not section[3]]
+               + [[kind, index, None, True]
+                  for _, kind, index in rewrite_sizes])
+    if pending:
+        measured = await measure_stream_packets(path)
+        file_size = _parse_media_file_size(full_text) or _to_int(real_size)
+        seen = duration
+        if partial and file_size:
+            try:
+                seen = duration * min(1.0, os.path.getsize(path) / float(file_size))
+            except (OSError, ZeroDivisionError):
+                seen = duration
+        # the scan reads the first `SCAN_SECONDS` of the track, so the measured
+        # bytes are scaled from that window up to the whole track
+        span = min(SCAN_SECONDS, seen) if seen else duration
+
+        for track_type, track_index, _, _ in pending:
+            stream_index = _mi_stream_index(fp_json, track_type, track_index)
+            track = _mi_track(mi_json, track_type, track_index) or {}
+            value = scale_measured_size(
+                measured.get(stream_index), span, duration)
+            if not value:
+                value = _estimate_stream_size(track, duration)
+            if value:
+                sizes[(track_type, track_index)] = value
+
+        for index, track_type, track_index in rewrite_sizes:
+            value = sizes.get((track_type, track_index))
+            if value:
+                lines[index] = _set_mi_value(
+                    lines[index], "~" + get_readable_bytes(value))
+
+        # insert the missing sizes as the first line under each header,
+        # last-first so earlier positions of the list stay valid
         for track_type, track_index, start, has_size in reversed(sections):
             if has_size:
                 continue
-            track = _mi_track(mi_json, track_type, track_index) or {}
-            estimate = _estimate_stream_size(track, duration)
-            if estimate:
+            value = sizes.get((track_type, track_index))
+            if value:
                 lines.insert(
-                    start + 1, f"{size_prefix}: ~{get_readable_bytes(estimate)}")
+                    start + 1, f"{size_prefix}: ~{get_readable_bytes(value)}")
 
-    return clean_mediainfo_text("\n".join(lines)), mi_json
+    return clean_mediainfo_text("\n".join(lines)), mi_json, sizes
 
 
 def _to_int(value):
@@ -261,11 +297,15 @@ def _estimate_stream_size(track, duration):
     return int(size) if size > 0 else None
 
 
-def _stream_size_text(track, duration, partial):
+def _stream_size_text(track, duration, partial, measured=None):
     """
-    Human readable size of one stream. Exact when the whole file was read,
-    estimated from the track bitrate (marked `~`) when only a part was read.
+    Human readable size of one stream. `measured` (bytes taken from the
+    stream's own packets, already scaled to the whole track) wins; otherwise
+    MediaInfo's exact stream size is used when the whole file was read, and a
+    bitrate estimate (marked `~`) as a last resort.
     """
+    if measured:
+        return f"~{get_readable_bytes(measured)}"
     raw = track.get("StreamSize")
     if raw and not partial:
         try:
@@ -278,6 +318,103 @@ def _stream_size_text(track, duration, partial):
     return f"~{get_readable_bytes(estimate)}" if estimate else None
 
 
+def _parse_media_file_size(text):
+    """Byte size from a `File size : 153.49 MiB` line, or 0."""
+    for line in text.splitlines():
+        if "File size" not in line:
+            continue
+        value = line.split(":", 1)[-1].strip()
+        match = re.match(r"([\d.,]+)\s*([KMGT]?i?B)", value)
+        if not match:
+            continue
+        try:
+            number = float(match.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        factor = {
+            "B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
+            "TB": 1000 ** 4, "KIB": 1024, "MIB": 1024 ** 2,
+            "GIB": 1024 ** 3, "TIB": 1024 ** 4,
+        }.get(match.group(2).upper())
+        if factor:
+            return int(number * factor)
+    return 0
+
+
+def _mi_stream_index(fp_json, type_name, index):
+    """
+    ffprobe stream index of the `index`-th stream of the given MediaInfo kind
+    (MediaInfo's `Text` is ffprobe's `subtitle`; track order otherwise
+    matches), or None.
+    """
+    if not fp_json:
+        return None
+    codec_type = {"Text": "subtitle"}.get(type_name, type_name.lower())
+    same = [stream for stream in fp_json.get("streams", []) or []
+            if stream.get("codec_type") == codec_type]
+    if index >= len(same):
+        return None
+    return same[index].get("index")
+
+
+async def measure_stream_packets(path, scan_seconds=SCAN_SECONDS):
+    """
+    Sum the encoded packet bytes per stream over the first `scan_seconds` of
+    the file with ffprobe (`-show_packets`), returning {ffprobe_index: bytes}.
+
+    Matroska files written by ffmpeg store no per-track bitrate, so MediaInfo
+    and ffprobe cannot report a stream size; the packets' own sizes are the
+    only measurement available.
+    """
+    args = ["ffprobe", "-v", "quiet"]
+    if scan_seconds and scan_seconds > 0:
+        args += ["-read_intervals", f"%+{int(scan_seconds)}"]
+    args += ["-show_entries", "packet=stream_index,size",
+             "-of", "json", path]
+
+    sizes = {}
+    try:
+        code, output = await run_process(args, timeout_seconds=180)
+    except Exception as error:
+        logger.warning(f"packet measurement failed on {path}: {error}")
+        return sizes
+
+    if code != 0 or not output.strip().startswith("{"):
+        return sizes
+
+    try:
+        data = json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return sizes
+
+    for packet in data.get("packets", []) or []:
+        try:
+            stream_index = int(packet.get("stream_index"))
+            size = int(str(packet.get("size")).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if size > 0:
+            sizes[stream_index] = sizes.get(stream_index, 0) + size
+
+    return sizes
+
+
+def scale_measured_size(measured, size_span, duration):
+    """
+    Scale bytes measured over `size_span` seconds to the whole `duration`.
+    Pass the full duration as `size_span` when the measurement already covers
+    the whole track / file.
+    """
+    if not measured or not duration:
+        return None
+    span = size_span or duration
+    try:
+        scaled = measured * (float(duration) / float(span))
+    except (TypeError, ZeroDivisionError):
+        return None
+    return int(scaled) if scaled > 0 else None
+
+
 def _mi_track(mi_json, type_name, index):
     """The `index`-th MediaInfo track of the given type (Video/Audio/Text)."""
     same = [t for t in (mi_json or {}).get("media", {}).get("track", [])
@@ -285,7 +422,8 @@ def _mi_track(mi_json, type_name, index):
     return same[index] if index < len(same) else None
 
 
-def build_summary(mi_json, display_name, real_size=None, partial=False):
+def build_summary(mi_json, display_name, real_size=None, partial=False,
+                  track_sizes=None):
     """Compact, human readable summary of the parsed MediaInfo JSON."""
     tracks = (mi_json or {}).get("media", {}).get("track", [])
     if not tracks:
@@ -326,7 +464,7 @@ def build_summary(mi_json, display_name, real_size=None, partial=False):
     video_tracks = [t for t in tracks if t.get("@type") == "Video"]
     if video_tracks:
         rendered = []
-        for track in video_tracks:
+        for index, track in enumerate(video_tracks):
             bits = [track.get("Format") or "?"]
             if track.get("Width") and track.get("Height"):
                 bits.append(f"{track['Width']}×{track['Height']}")
@@ -337,7 +475,9 @@ def build_summary(mi_json, display_name, real_size=None, partial=False):
                 bits.append(hdr)
             elif "Dolby Vision" in (track.get("Format_Profile") or ""):
                 bits.append("Dolby Vision")
-            size_text = _stream_size_text(track, total_duration, partial)
+            size_text = _stream_size_text(
+                track, total_duration, partial,
+                (track_sizes or {}).get(("Video", index)))
             if size_text:
                 bits.append(size_text)
             rendered.append(" · ".join(bits))
@@ -346,7 +486,7 @@ def build_summary(mi_json, display_name, real_size=None, partial=False):
     audio_tracks = [t for t in tracks if t.get("@type") == "Audio"]
     if audio_tracks:
         rendered = []
-        for track in audio_tracks:
+        for index, track in enumerate(audio_tracks):
             bits = [track.get("Format") or "?"]
             bit_rate = _track_bitrate(track)
             if bit_rate:
@@ -365,7 +505,9 @@ def build_summary(mi_json, display_name, real_size=None, partial=False):
             title = (track.get("Title") or "").strip()
             if title:
                 bits.append(f"“{title}”")
-            size_text = _stream_size_text(track, total_duration, partial)
+            size_text = _stream_size_text(
+                track, total_duration, partial,
+                (track_sizes or {}).get(("Audio", index)))
             if size_text:
                 bits.append(size_text)
             rendered.append(" ".join(bits))
@@ -426,7 +568,7 @@ async def _resolve_paste_url(url, timeout=15.0):
 
 async def _send_result(
     reply_msg, target_message, path, text, mi_json, display_name, real_size,
-    isRaw, partial=False
+    isRaw, partial=False, track_sizes=None
 ):
     if not text:
         return await safe_edit(
@@ -446,7 +588,7 @@ async def _send_result(
             pass
         return
 
-    summary = (build_summary(mi_json, display_name, real_size, partial)
+    summary = (build_summary(mi_json, display_name, real_size, partial, track_sizes)
                or f"🎬 **{display_name}**")
 
     paste_url = None
@@ -494,12 +636,12 @@ async def telegram_mediainfo(client, media_message, isRaw=False):
 
         real_size = getattr(media, "file_size", None)
         partial = 0 < downloaded < _to_int(real_size)
-        text, mi_json = await build_mediainfo(
-            path, mi_json, display_name, real_size, partial)
+        text, mi_json, track_sizes = await build_mediainfo(
+            path, mi_json, display_name, real_size, partial, fp_json)
 
         await _send_result(
             reply_msg, media_message, path, text, mi_json, display_name,
-            real_size, isRaw, partial)
+            real_size, isRaw, partial, track_sizes)
 
     except Exception as error:
         traceback.print_exc()
@@ -524,12 +666,12 @@ async def ddl_mediainfo(message, url, isRaw=False):
             url, reply_msg, display_name)
 
         partial = 0 < os.path.getsize(path) < _to_int(total_size)
-        text, mi_json = await build_mediainfo(
-            path, mi_json, display_name, total_size, partial)
+        text, mi_json, track_sizes = await build_mediainfo(
+            path, mi_json, display_name, total_size, partial, fp_json)
 
         await _send_result(
             reply_msg, message, path, text, mi_json, display_name,
-            total_size, isRaw, partial)
+            total_size, isRaw, partial, track_sizes)
 
     except Exception as error:
         traceback.print_exc()
@@ -561,12 +703,12 @@ async def gdrive_mediainfo(message, url, isRaw=False):
             headers={"Authorization": f"Bearer {drive.get_bearer_token()}"})
 
         partial = 0 < downloaded < _to_int(real_size)
-        text, mi_json = await build_mediainfo(
-            path, mi_json, display_name, real_size, partial)
+        text, mi_json, track_sizes = await build_mediainfo(
+            path, mi_json, display_name, real_size, partial, fp_json)
 
         await _send_result(
             reply_msg, message, path, text, mi_json, display_name,
-            real_size, isRaw, partial)
+            real_size, isRaw, partial, track_sizes)
 
     except Exception as error:
         logger.error(f"gdrive mediainfo failed: {error}")

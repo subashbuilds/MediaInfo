@@ -578,6 +578,8 @@ SPEK_PLOT_BOTTOM = 36           # bottom margin (time labels)
 SPEK_LEGEND_WIDTH = 14          # width of the colour legend strip
 SPEK_DB_RANGE = 120             # dynamic range of the legend, in dB
 SPEK_TIME_STEP = 300            # seconds between time-axis ticks (5 minutes)
+SPEK_RENDER_TIMEOUT = 600       # seconds SoX may spend on the spek-style pass
+SPEK_PLAIN_TIMEOUT = 300        # seconds for the plain fallback (no Pillow)
 SPEK_FREQ_MIRROR = False        # flip vertically if the graph is upside down
 # SoX is much faster when the plot height is 1 + 2**n (power-of-two DFT);
 # 1025 gives a 2048-point DFT and is scaled to the canvas height afterwards.
@@ -833,13 +835,14 @@ def _draw_spectrogram_canvas(plot, title, desc, sample_rate, duration, version):
                   font=font_small, fill=(255, 255, 255))
     version_text = f"spek {version}"
     version_width = draw.textlength(version_text, font=font_bold)
-    draw.text((width - right - version_width, 3), version_text,
+    draw.text((width - SPEK_PLOT_RIGHT - version_width, 3), version_text,
               font=font_bold, fill=(255, 255, 255))
 
     return canvas
 
 
-async def _sox_raw_spectrogram(wav_path, columns, rows_value, duration=None):
+async def _sox_raw_spectrogram(wav_path, columns, rows_value, duration=None,
+                               timeout_seconds=SPEK_RENDER_TIMEOUT):
     """
     Run SoX with `-r` (no axes/legends) and return the raw PNG path.
 
@@ -856,8 +859,9 @@ async def _sox_raw_spectrogram(wav_path, columns, rows_value, duration=None):
     ]
     if duration and duration > 0:
         args += ["-d", f"{duration:.3f}"]
+
     try:
-        code, output = await run_process(args, timeout_seconds=900)
+        code, output = await run_process(args, timeout_seconds=timeout_seconds)
     except asyncio.TimeoutError:
         logger.error("sox spectrogram (raw pass) timed out")
         cleanup_paths(png_path)
@@ -913,9 +917,12 @@ async def _render_spek_spectrogram(wav_path, png_path, title, desc, version,
 
 async def _render_plain_sox_spectrogram(wav_path, png_path, title, comment):
     """Plain SoX spectrogram — fallback used when Pillow is unavailable."""
+    # SoX sets its DFT size to 2*(y-1), so `-y 513` gives a 1024-point
+    # (power-of-two) transform. A non-power-of-two height such as 900 forces
+    # SoX's much slower generic transform, which times out on long tracks.
     args = [
         "sox", wav_path, "-n", "spectrogram",
-        "-x", "1600", "-y", "900",
+        "-x", "1600", "-y", "513",
         "-z", str(SPEK_DB_RANGE), "-w", "Kaiser",
         "-o", png_path,
     ]
@@ -925,7 +932,7 @@ async def _render_plain_sox_spectrogram(wav_path, png_path, title, comment):
         args += ["-c", comment[:150]]
 
     try:
-        code, output = await run_process(args, timeout_seconds=900)
+        code, output = await run_process(args, timeout_seconds=SPEK_PLAIN_TIMEOUT)
     except asyncio.TimeoutError:
         logger.error("sox spectrogram timed out")
         return False
