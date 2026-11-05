@@ -226,7 +226,7 @@ async def generate_spek(client, message: Message):
         "• Or pass a link: `/spek https://example.com/video.mkv` "
         "(downloaded fully unless the file is huge)\n\n"
         "The time axis is marked every 5 minutes and ends at the real track "
-        "length (a 2 h 43 min track ends at `163:00`)."
+        "length (a 2 h 43 min track ends at `2:43:00`)."
     )
 
     if message.reply_to_message:

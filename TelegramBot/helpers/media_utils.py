@@ -656,13 +656,17 @@ def _format_freq(hertz):
 
 
 def _format_time(seconds):
+    """Axis time label: `M:SS` normally, `H:MM:SS` for tracks of an hour or more."""
     total = max(0, int(round(seconds)))
+    hours, rest = divmod(total, 3600)
+    if hours:
+        return f"{hours}:{rest // 60:02d}:{rest % 60:02d}"
     return f"{total // 60}:{total % 60:02d}"
 
 
 def spek_track_description(track, sox_y=SPEK_SOX_Y, window="Hann",
                            stream_number=None, stream_total=None):
-    """`Stream 1 / 1: E-AC-3, 640 kbps, 48000 Hz, mono (6 ch downmix), W:2048, F:Hann`."""
+    """`Stream 1 / 1: E-AC-3, 640 kbps, 48000 Hz, 6 channels, W:2048, F:Hann`."""
     parts = [str(track.get("codec") or "Audio")]
 
     bit_rate = track.get("bit_rate")
@@ -681,17 +685,14 @@ def spek_track_description(track, sox_y=SPEK_SOX_Y, window="Hann",
         except (TypeError, ValueError):
             pass
 
-    # the spectrogram is always rendered from a mono downmix, so the header
-    # says mono and only mentions the source channel count
+    # the spectrogram is rendered from a mono downmix; name the source channel
+    # count plainly ("6 channels") instead of the internal downmix wording
     channels = track.get("channels")
     try:
         channels = int(channels) if channels else 0
     except (TypeError, ValueError):
         channels = 0
-    if channels > 1:
-        parts.append(f"mono ({channels} ch downmix)")
-    else:
-        parts.append("mono")
+    parts.append(f"{channels} channels" if channels > 1 else "mono")
 
     parts.append(f"W:{2 * (sox_y - 1)}")
     parts.append(f"F:{window}")
@@ -784,12 +785,21 @@ def _draw_spectrogram_canvas(plot, title, desc, sample_rate, duration, version):
             value += step
 
     # Time axis (bottom): a tick every 5 minutes, with the true end of the
-    # audio as the final label (a 2:43:00 track ends at "163:00").
+    # audio as the final label (a 2:43:00 track ends at "163:00"). The loop
+    # stops short of a tick that would collide with that end label, otherwise
+    # the last two labels are drawn on top of each other.
     if duration and duration > 0:
         step = SPEK_TIME_STEP
+        end_x = left + plot_w
+        end_label = _format_time(duration)
+        min_gap = draw.textlength(end_label, font=font_small)
         value = 0.0
         while value <= duration + 1e-9:
             x = left + (value / duration) * plot_w
+            is_end = value >= duration - 1e-9
+            # skip a tick whose label would run into the end label
+            if is_end or (x != left and end_x - x < min_gap):
+                break
             draw.line([x, top + plot_h + 1, x, top + plot_h + 5],
                       fill=(255, 255, 255))
             label = _format_time(value)
@@ -798,12 +808,10 @@ def _draw_spectrogram_canvas(plot, title, desc, sample_rate, duration, version):
                       font=font_small, fill=(255, 255, 255))
             value += step
 
-        x = left + plot_w
-        draw.line([x, top + plot_h + 1, x, top + plot_h + 5],
+        draw.line([end_x, top + plot_h + 1, end_x, top + plot_h + 5],
                   fill=(255, 255, 255))
-        label = _format_time(duration)
-        label_width = draw.textlength(label, font=font_small)
-        draw.text((x - label_width / 2, top + plot_h + 8), label,
+        label_width = draw.textlength(end_label, font=font_small)
+        draw.text((end_x - label_width / 2, top + plot_h + 8), end_label,
                   font=font_small, fill=(255, 255, 255))
 
     # Colour legend (right strip) with dB labels.

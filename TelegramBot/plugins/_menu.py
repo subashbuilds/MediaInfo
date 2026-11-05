@@ -18,9 +18,11 @@ from TelegramBot.helpers.media_utils import GDRIVE_REGEX, URL_REGEX, get_media
 from TelegramBot.plugins.mediainfo import (
     telegram_mediainfo, ddl_mediainfo, gdrive_mediainfo)
 from TelegramBot.plugins.screenshot import (
-    telegram_screenshot, ddl_screenshot, gdrive_screenshot)
+    telegram_screenshot, ddl_screenshot, gdrive_screenshot,
+    screenshot_page_markup, screenshot_pages)
 from TelegramBot.plugins.videosample import (
-    telegram_videosample, ddl_videosample, gdrive_videosample)
+    telegram_videosample, ddl_videosample, gdrive_videosample,
+    custom_waiters, info_dictionary, prompt_custom_length)
 from TelegramBot.plugins.audiospek import spek_telegram, spek_link
 from TelegramBot.logging import LOGGER
 
@@ -45,10 +47,10 @@ MENU_KEYBOARD = InlineKeyboardMarkup([
 
 SAMPLE_KEYBOARD = InlineKeyboardMarkup([
     [
-        InlineKeyboardButton("1 min", callback_data="menu|sample_1"),
-        InlineKeyboardButton("3 min", callback_data="menu|sample_3"),
-        InlineKeyboardButton("5 min", callback_data="menu|sample_5"),
+        InlineKeyboardButton("30 sec", callback_data="menu|sample_30"),
+        InlineKeyboardButton("60 sec", callback_data="menu|sample_60"),
     ],
+    [InlineKeyboardButton("✏️ Custom", callback_data="menu|sample_custom")],
     [InlineKeyboardButton("⬅️ Back", callback_data="menu|back")],
 ])
 
@@ -147,10 +149,26 @@ async def menu_callbacks(client: Client, callback_query: CallbackQuery):
             if not (has_media or url):
                 return await callback_query.answer(
                     "No media or link found in the original message.", show_alert=True)
+            # remembered so the Custom prompt can hand back to the same flow
+            info_dictionary[original.id] = {
+                "message": original, "client": client,
+                "type": "telegram" if has_media else "gdrive" if is_gdrive else "ddl",
+                "media": original, "url": url}
             return await callback_query.message.edit(
                 "⏱ Choose the duration of the sample video:",
                 reply_markup=SAMPLE_KEYBOARD,
                 disable_web_page_preview=True)
+
+        if action == "sample_custom":
+            if not (has_media or url):
+                return await callback_query.answer(
+                    "No media or link found in the original message.", show_alert=True)
+            info = info_dictionary.get(original.id)
+            if not info:
+                return await callback_query.answer(
+                    "This menu is too old, please send the file again.", show_alert=True)
+            return await prompt_custom_length(
+                client, callback_query, original, info, "menu|sample")
 
         if action.startswith("sample_"):
             if not (has_media or url):
@@ -178,12 +196,18 @@ async def menu_callbacks(client: Client, callback_query: CallbackQuery):
             return await ddl_mediainfo(original, url, isRaw=is_raw)
 
         if action == "ss":
-            await close_menu()
-            if has_media:
-                return await telegram_screenshot(client, original, frame_count=10)
-            if is_gdrive:
-                return await gdrive_screenshot(original, url, None, 10, 5, False, False)
-            return await ddl_screenshot(original, url, None, 10, 5, False, False)
+            if not (has_media or url):
+                return await callback_query.answer(
+                    "No media or link found in the original message.", show_alert=True)
+            # remembered so the count picker can hand back to this same flow
+            screenshot_pages[original.id] = {
+                "message": original, "client": client,
+                "type": "telegram" if has_media else "gdrive" if is_gdrive else "ddl",
+                "media": original, "url": url}
+            return await callback_query.message.edit(
+                "📸 How many screenshots do you want?",
+                reply_markup=screenshot_page_markup(0),
+                disable_web_page_preview=True)
 
         if action == "spek":
             await close_menu()

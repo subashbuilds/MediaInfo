@@ -12,7 +12,8 @@ import datetime
 import traceback
 from urllib.parse import unquote
 
-from pyrogram.types import InputMediaPhoto, Message
+from pyrogram.types import (
+    InputMediaPhoto, Message, InlineKeyboardMarkup, InlineKeyboardButton)
 from pyrogram import Client, filters
 from pyrogram.errors import MessageNotModified
 
@@ -301,7 +302,7 @@ screenshot_help = """Generates screenshots from Google Drive links, Telegram fil
 
 **➜ Additional flags**
 
-`--count=10` — number of screenshots (default 10, max 20)
+`--count=10` — number of screenshots (default 10, max 60)
 `--fps=10` — seconds between two screenshots (default 5, max 15)
 `--time=01:20:10` — timestamp to start from (HH:MM:SS)
 `--hdr` — for HDR videos
@@ -309,6 +310,124 @@ screenshot_help = """Generates screenshots from Google Drive links, Telegram fil
 Only `--count` works for Telegram files.
 
 **Example:** `/ss https://videolink.mkv --count=10 --fps=1 --hdr --time=00:20:00`"""
+
+# picker shown by the inline menu: numbers 1-10, then ➡️ for the next page
+SCREENSHOT_COUNT_MAX = 60
+SCREENSHOT_PAGE_SIZE = 10
+screenshot_pages: dict = {}
+custom_waiters: dict = {}
+
+
+def screenshot_page_markup(page):
+    """Number keys for one page of 10, with ➡️/⬅️ to reach the next/previous page."""
+    first = page * SCREENSHOT_PAGE_SIZE + 1
+    numbers = list(range(first, first + SCREENSHOT_PAGE_SIZE))
+    rows = [numbers[i:i + 5] for i in range(0, len(numbers), 5)]
+    keyboard = [[
+        InlineKeyboardButton(str(number), callback_data=f"screenshot_{number}")
+        for number in row
+    ] for row in rows]
+
+    # page arrows keep the same menu message, so the file is not fetched twice
+    arrows = []
+    if page > 0:
+        arrows.append(InlineKeyboardButton(
+            "⬅️", callback_data=f"screenshot_page_{page - 1}"))
+    if first + SCREENSHOT_PAGE_SIZE <= SCREENSHOT_COUNT_MAX:
+        arrows.append(InlineKeyboardButton(
+            "➡️", callback_data=f"screenshot_page_{page + 1}"))
+    if arrows:
+        keyboard.append(arrows)
+    keyboard.append([InlineKeyboardButton("✏️ Custom", callback_data="screenshot_custom")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def prompt_custom_count(client, callback_query, original, info):
+    """Turn the screenshot menu into a prompt that waits for a typed count."""
+    custom_waiters[callback_query.message.chat.id] = (
+        original.id, callback_query.from_user.id, info, callback_query.message.id)
+    await callback_query.message.edit(
+        f"✏️ Send the number of screenshots (1 - {SCREENSHOT_COUNT_MAX}).",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="screenshot_back")]]))
+
+
+async def start_screenshots(client, info, count):
+    """Generate screenshots for the menu that asked for them."""
+    if info["type"] == "telegram":
+        return await telegram_screenshot(client, info["media"], frame_count=count)
+    if info["type"] == "gdrive":
+        return await gdrive_screenshot(info["message"], info["url"], None, count, 5, False, False)
+    return await ddl_screenshot(info["message"], info["url"], None, count, 5, False, False)
+
+
+def _awaiting_count(_, __, message: Message) -> bool:
+    """Only match a typed count from the user a Custom prompt is waiting on."""
+    waiting = custom_waiters.get(message.chat.id)
+    return bool(waiting and message.from_user
+                and message.from_user.id == waiting[1])
+
+
+awaiting_count = filters.create(_awaiting_count)
+
+
+@Client.on_message(filters.text & awaiting_count & check_auth, group=0)
+async def screenshot_custom_count(client, message: Message):
+    """Read the count typed after pressing Custom on a screenshot menu."""
+    waiting = custom_waiters.get(message.chat.id)
+    if not waiting:
+        return
+
+    original_id, _, info, menu_id = waiting
+    match = re.fullmatch(r"\s*(\d{1,3})\s*", message.text or "")
+    count = int(match[1]) if match else 0
+    if not 1 <= count <= SCREENSHOT_COUNT_MAX:
+        return await message.reply_text(
+            f"❌ Send a whole number between 1 and {SCREENSHOT_COUNT_MAX}.",
+            quote=True)
+
+    custom_waiters.pop(message.chat.id, None)
+    screenshot_pages.pop(original_id, None)
+
+    try:
+        await client.delete_messages(message.chat.id, menu_id)
+    except Exception:
+        pass
+    return await start_screenshots(client, info, count)
+
+
+@Client.on_callback_query(filters.regex(r"^screenshot_(?:custom|page_\d+|\d+)$"))
+async def screenshot_count_callback(client, callback_query):
+    original = callback_query.message.reply_to_message
+    info = screenshot_pages.get(original.id) if original else None
+    if not info:
+        return await callback_query.answer(
+            "This menu is too old, please send the file again.", show_alert=True)
+
+    data = callback_query.data
+    await callback_query.answer()
+
+    if data.startswith("screenshot_page_"):
+        page = int(data.rsplit("_", 1)[-1])
+        return await callback_query.message.edit_reply_markup(
+            screenshot_page_markup(page))
+
+    if data == "screenshot_custom":
+        return await prompt_custom_count(client, callback_query, original, info)
+
+    count = int(data.split("_")[-1])
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
+    return await start_screenshots(client, info, count)
+
+
+@Client.on_callback_query(filters.regex(r"^screenshot_back$"))
+async def screenshot_back(client, callback_query):
+    await callback_query.answer()
+    return await callback_query.message.edit_reply_markup(
+        screenshot_page_markup(0))
 
 
 @Client.on_message(filters.command(["screenshot", "ss"]) & check_auth)
@@ -321,7 +440,7 @@ async def screenshot(client: Client, message: Message):
             user_input = message.text.split(None, 1)[1]
             match = re.search(r"(?:--|-)count=(\d+)", user_input)
             if match:
-                frame_count = min(int(match[1]), 20)
+                frame_count = min(int(match[1]), SCREENSHOT_COUNT_MAX)
         return await telegram_screenshot(client, message.reply_to_message, frame_count)
 
     if len(message.command) < 2:
@@ -333,7 +452,7 @@ async def screenshot(client: Client, message: Message):
     fps = min(int(match[1]), 15) if match else 5
 
     match = re.search(r"(?:--|-)count=(\d+)", user_input)
-    frame_count = min(int(match[1]), 20) if match else 10
+    frame_count = min(int(match[1]), SCREENSHOT_COUNT_MAX) if match else 10
 
     match = re.search(r"--time=(\d{2}:\d{2}:\d{2})", user_input)
     time = match.group(1) if match else None

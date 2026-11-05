@@ -17,8 +17,8 @@
 - **Automatic action menu** — just send any media file (video / audio / document / voice note) or a direct download / Google Drive link, and the bot instantly replies with an inline menu: 🎬 Mediainfo · 📄 Raw info · 📸 Screenshots · 🎵 Spectrogram · ✂️ Sample. **No slash commands needed.**
 - Generating **detailed Mediainfo** from Google Drive links, direct download links, and Telegram files — full `mediainfo -f` output (all fields: colour primaries, HDR metadata, stream sizes, languages, tags) posted to a Telegraph page, plus a rich summary (container, duration, resolution, HDR, codecs, audio tracks, subtitles) directly in the chat.
 - Creating screenshots from Google Drive links, direct download links, and Telegram files, and posting them on slow.pics
-- Generating custom-duration video samples (1 / 3 / 5 min) cut from a **random position** (~15–40% into the video) instead of the beginning.
-- Creating **spectrograms in the spek 0.8.5 / classic SoX style** (SoX heat palette, header with file name + stream info, kHz frequency axis, mm:ss time axis, dB colour legend) — for **video files the bot generates one spectrogram per audio track**, each captioned with codec, bitrate (192 kbps / 640 kbps …), channels, sample rate and language. Each track is analysed in mono so the image is a **single graph** (no double pane). Voice notes and nameless audio files are supported too.
+- Generating custom-length video samples (30 s / 60 s / custom) cut from a **random position** (~15–40% into the video) instead of the beginning.
+- Creating **spectrograms in the spek 0.8.5 / classic SoX style** (SoX heat palette, header with file name + stream info, kHz frequency axis, mm:ss time axis — `h:mm:ss` once a track passes an hour — dB colour legend) — for **video files the bot generates one spectrogram per audio track**, each captioned with codec, bitrate (192 kbps / 640 kbps …), channels, sample rate and language. Each track is analysed in mono so the image is a **single graph** (no double pane). Voice notes and nameless audio files are supported too.
 - **Everything works via partial downloads** — the bot streams only the head of the file (25 → 75 → 200 MB stages until the media parses) or uses HTTP Range requests for links, so it **never downloads the whole file**.
 - Pasting text to the katb.in website.
 
@@ -48,9 +48,9 @@ Simply send / forward any media file or paste a link in the chat — the bot rep
 |--------|--------------|
 | 🎬 **Mediainfo** | Detailed mediainfo → Telegraph page + summary in chat |
 | 📄 **Raw info** | Raw mediainfo text sent as a document |
-| 📸 **Screenshots** | 10 screenshots uploaded to slow.pics |
+| 📸 **Screenshots** | Pick 1–60 screenshots → uploaded to slow.pics |
 | 🎵 **Spectrogram** | One single-graph spek-style spectrogram per audio track, with bitrate |
-| ✂️ **Sample** | Pick 1 / 3 / 5 minutes → sample video from a random position |
+| ✂️ **Sample** | Pick 30 s / 60 s / custom → sample video from a random position |
 
 Only the person who sent the media (or a sudo user) can press the buttons.
 
@@ -64,7 +64,7 @@ Only the person who sent the media (or a sudo user) can press the buttons.
 
  <b> Additional Flags for screenshot and mediainfo command :- </b>
 
-**--count=10** *[ Number of screenshots. Default 10, Max 20 ]*, 
+**--count=10** *[ Number of screenshots. Default 10, Max 60 ]*, 
 **--fps=10**  *[ Difference between two consecutive screenshots in seconds. Default 5, Max 15 ]*.
 **--time=01:20:10**  *[ Time from where the screenshots should be taken in HH:MM:SS format ]*,
 **--hdr**  *[ For HDR Videos.]*
@@ -80,7 +80,7 @@ Only the person who sent the media (or a sudo user) can press the buttons.
 - **Telegram files** are downloaded progressively: the bot fetches the first 25 MB, tries to parse them with ffprobe/MediaInfo, and only downloads more (75 MB → 200 MB) if needed. Small audio files are fetched fully so spectrograms cover the whole track.
 - **Links / Google Drive** are read with HTTP Range requests (`bytes=0-N`) using the same progressive stages — authenticated with your Google token for Drive links.
 - The raw text output of `mediainfo -f` is cleaned up and posted to Telegraph; the chat reply shows a compact summary built from the MediaInfo JSON (duration, resolution, fps, HDR, per-track codecs and languages). Fields that `mediainfo -f` prints several times per stream (raw value, human value, timecode) are collapsed to the single most readable one and internal bookkeeping fields (`Count`, `Stream identifier`, `Unique ID`, `*_Source`, ...) are dropped — without this a 38-subtitle file produced ~67 KB of text and Telegraph rejected the page as *content too big*.
-- Spectrograms are rendered with SoX (raw `-r` pass with `-z 120 -w Kaiser`), one per audio track, from the **whole track** (audio and video files are downloaded in full; only very large remote links analyse a part, and the caption says so). Each track is downmixed to **mono** PCM with `ffmpeg -map 0:a:N -ac 1` (mono keeps SoX to a single graph instead of one pane per channel, and keeps the image and WAV small). The raw image is then composed with Pillow into the **spek 0.8.5 layout**: file name + stream info header, kHz frequency axis, a **5-minute time axis that ends at the real track length** (a 2 h 43 min track ends at `163:00`), and the dB colour legend on the right. The image width grows with the length so the ticks stay readable. The legend uses SoX's exact default palette, so the colours match the classic viewer pixel-for-pixel.
+- Spectrograms are rendered with SoX (raw `-r` pass with `-z 120 -w Kaiser`), one per audio track, from the **whole track** (audio and video files are downloaded in full; only very large remote links analyse a part, and the caption says so). Each track is downmixed to **mono** PCM with `ffmpeg -map 0:a:N -ac 1` (mono keeps SoX to a single graph instead of one pane per channel, and keeps the image and WAV small). The raw image is then composed with Pillow into the **spek 0.8.5 layout**: file name + stream info header, kHz frequency axis, a **5-minute time axis that ends at the real track length** (a 2 h 43 min track ends at `2:43:00`), and the dB colour legend on the right. The image width grows with the length so the ticks stay readable. The legend uses SoX's exact default palette, so the colours match the classic viewer pixel-for-pixel.
 - **Telegraph posts** are created on the same domain that issued the access token (`graph.org` by default, `telegra.ph` as fallback) — creating a page on the wrong domain is what used to make the link return "404 not found".
 
  _____

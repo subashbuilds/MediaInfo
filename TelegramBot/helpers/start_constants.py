@@ -21,7 +21,7 @@ COMMAND_TEXT = """🗒️ Documentation for commands available to users
 
 • **Additional Flags** for screenshot and mediainfo commands :-
 
-`--count=10` [ Number of screenshots. Default 10, Max 20 ], 
+`--count=10` [ Number of screenshots. Default 10, Max 60 ], 
 
 `--fps=10` [ Difference between two consecutive screenshots in seconds. Default 5, Max 15 ]. 
 

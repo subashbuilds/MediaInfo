@@ -53,13 +53,23 @@ def _thumb_or_none():
     return thumb_path if thumb_path and os.path.exists(thumb_path) else None
 
 
+def _sample_label(seconds):
+    """`30 sec` / `2 min` — how a sample length is shown to the user."""
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60} min"
+    return f"{seconds} sec"
+
+
+CUSTOM_SAMPLE_MAX = 3600  # seconds a custom sample may ask for
+
+
 async def generate_sample_from_link(
     message, replymsg, file_url, duration, headers, filename, timestamp
 ):
     """Cut a sample straight from a remote URL with ffmpeg (streaming copy)."""
     await safe_edit(
         replymsg,
-        f"✂️ Generating **{duration} min** sample from "
+        f"✂️ Generating **{_sample_label(duration)}** sample from "
         f"`{unquote(filename)}`, please wait ...")
 
     rand_str = randstr()
@@ -72,7 +82,7 @@ async def generate_sample_from_link(
          "-y",
          "-ss", str(timestamp),
          "-i", file_url,
-         "-t", str(datetime.timedelta(minutes=duration)),
+         "-t", str(int(duration)),
          "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?",
          "-c", "copy",
          output_path],
@@ -93,7 +103,7 @@ async def generate_sample_from_link(
     await safe_edit(replymsg, "📤 Uploading the video file, please wait ...")
     await message.reply_video(
         video=output_path,
-        caption=f"[**{duration}min Sample** from {timestamp}] {filename}",
+        caption=f"[**{_sample_label(duration)} Sample** from {timestamp}] {filename}",
         thumb=_thumb_or_none(),
         quote=True)
 
@@ -205,7 +215,7 @@ async def telegram_videosample(client, media_message, duration):
     file_size = getattr(media, "file_size", 0) or 0
 
     replymsg = await media_message.reply_text(
-        f"✂️ Generating **{duration} min** sample from `{filename}`, "
+        f"✂️ Generating **{_sample_label(duration)}** sample from `{filename}`, "
         "please wait ...", quote=True)
     download_path = output_path = None
     try:
@@ -224,7 +234,7 @@ async def telegram_videosample(client, media_message, duration):
         #    ~50% extra head-room gives the sample room to start at a random
         #    position inside the downloaded part instead of the very beginning.
         bytes_per_second = (file_size / total_duration) if file_size else 0
-        needed_mb = int((bytes_per_second * duration * 60 * 1.5) / (1024 * 1024)) + 5
+        needed_mb = int((bytes_per_second * duration * 1.5) / (1024 * 1024)) + 5
         download_mb = max(min(needed_mb, 2000), 25)
 
         rand_str = randstr()
@@ -238,7 +248,7 @@ async def telegram_videosample(client, media_message, duration):
                 file.write(chunk)
 
         # 3) pick a random start position inside the downloaded part
-        sample_seconds = duration * 60
+        sample_seconds = duration
         covered = (covered_duration(
             total_duration, os.path.getsize(download_path),
             file_size) or total_duration)
@@ -253,7 +263,7 @@ async def telegram_videosample(client, media_message, duration):
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             *seek_args,
             "-i", download_path,
-            "-t", str(datetime.timedelta(minutes=duration)),
+            "-t", str(int(duration)),
             "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?",
             "-c", "copy",
             output_path]
@@ -270,7 +280,7 @@ async def telegram_videosample(client, media_message, duration):
                 ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                  "-y",
                  "-i", download_path,
-                 "-t", str(datetime.timedelta(minutes=duration)),
+                 "-t", str(int(duration)),
                  "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?",
                  "-c", "copy",
                  output_path],
@@ -289,7 +299,7 @@ async def telegram_videosample(client, media_message, duration):
         await safe_edit(replymsg, "📤 Uploading the video file, please wait ...")
         await media_message.reply_video(
             video=output_path,
-            caption=f"[**{duration}min Sample** from {timestamp}] {filename}",
+            caption=f"[**{_sample_label(duration)} Sample** from {timestamp}] {filename}",
             thumb=_thumb_or_none(),
             quote=True)
 
@@ -310,40 +320,111 @@ async def telegram_videosample(client, media_message, duration):
 
 sample_duration_buttons = [
     [
-        InlineKeyboardButton("1 min", callback_data="videosample_1"),
-        InlineKeyboardButton("3 min", callback_data="videosample_3"),
-        InlineKeyboardButton("5 min", callback_data="videosample_5"),
+        InlineKeyboardButton("30 sec", callback_data="videosample_30"),
+        InlineKeyboardButton("60 sec", callback_data="videosample_60"),
+        InlineKeyboardButton("✏️ Custom", callback_data="videosample_custom"),
     ]
 ]
 
 info_dictionary: dict = {}
+custom_waiters: dict = {}
 
 
-@Client.on_callback_query(filters.regex(r"^videosample_\d+$"))
+@Client.on_callback_query(filters.regex(r"^videosample_(?:custom|\d+)$"))
 async def videosample_duration(client, callback_query):
-    duration = int(callback_query.data.split("_")[-1])
-
     original = callback_query.message.reply_to_message
-    info = info_dictionary.pop(original.id, None) if original else None
+    info = info_dictionary.get(original.id) if original else None
     if not info:
         return await callback_query.answer(
             "This menu is too old, please run /sample again.", show_alert=True)
+
+    await callback_query.answer()
+
+    if callback_query.data == "videosample_custom":
+        # keep the info entry so the ⬅️ Back arrow can restore the picker
+        return await prompt_custom_length(
+            client, callback_query, original, info, "videosample_back")
+
+    info_dictionary.pop(original.id, None)
+    await _start_videosample(client, info, int(callback_query.data.split("_")[-1]))
 
     try:
         await client.delete_messages(
             callback_query.message.chat.id, callback_query.message.id)
     except Exception:
         pass
-    await callback_query.answer()
 
+
+@Client.on_callback_query(filters.regex(r"^videosample_back$"))
+async def videosample_back(client, callback_query):
+    original = callback_query.message.reply_to_message
+    info = info_dictionary.get(original.id) if original else None
+    custom_waiters.pop(callback_query.message.chat.id, None)
+    if not info:
+        return await callback_query.answer(
+            "This menu is too old, please run /sample again.", show_alert=True)
+    await callback_query.answer()
+    await callback_query.message.edit(
+        "⏱ Choose the duration of the sample video:",
+        reply_markup=InlineKeyboardMarkup(sample_duration_buttons),
+        disable_web_page_preview=True)
+
+
+async def _start_videosample(client, info, duration):
+    """
+    Run the sample generation for the menu that asked for it. The info entry is
+    kept (not popped) so a mistyped custom length can be retried.
+    """
     if info["type"] == "gdrive":
         return await gdrive_videosample(info["message"], info["url"], duration)
-
     if info["type"] == "ddl":
         return await ddl_videosample(info["message"], info["url"], duration)
+    return await telegram_videosample(info["client"], info["media"], duration)
 
-    return await telegram_videosample(
-        info["client"], info["message"].reply_to_message, duration)
+
+async def prompt_custom_length(client, callback_query, original, info, back_data):
+    """Turn a sample menu into a prompt that waits for a typed length."""
+    custom_waiters[callback_query.message.chat.id] = (
+        original.id, callback_query.from_user.id, info, callback_query.message.id)
+    await callback_query.message.edit(
+        f"✏️ Send the sample length in seconds (10 - {CUSTOM_SAMPLE_MAX}).",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data=back_data)]]))
+
+
+def _awaiting_length(_, __, message: Message) -> bool:
+    """Only match a typed length from the user a Custom prompt is waiting on."""
+    waiting = custom_waiters.get(message.chat.id)
+    return bool(waiting and message.from_user
+                and message.from_user.id == waiting[1])
+
+
+awaiting_length = filters.create(_awaiting_length)
+
+
+@Client.on_message(filters.text & awaiting_length & check_auth, group=0)
+async def videosample_custom_length(client, message: Message):
+    """Read the length typed after pressing Custom on a sample menu."""
+    waiting = custom_waiters.get(message.chat.id)
+    if not waiting:
+        return
+
+    original_id, _, info, menu_id = waiting
+    match = re.fullmatch(r"\s*(\d{1,4})\s*", message.text or "")
+    seconds = int(match[1]) if match else 0
+    if not 10 <= seconds <= CUSTOM_SAMPLE_MAX:
+        return await message.reply_text(
+            f"❌ Send a whole number of seconds between 10 and {CUSTOM_SAMPLE_MAX}.",
+            quote=True)
+
+    custom_waiters.pop(message.chat.id, None)
+    info_dictionary.pop(original_id, None)
+
+    try:
+        await client.delete_messages(message.chat.id, menu_id)
+    except Exception:
+        pass
+    return await _start_videosample(client, info, seconds)
 
 
 @Client.on_message(filters.command(["sample", "trim"]) & check_auth)
@@ -360,7 +441,8 @@ async def video_sample(client: Client, message: Message):
             return await message.reply_text(
                 "Reply to a video file to generate a sample.", quote=True)
         info_dictionary[message.id] = {
-            "message": message, "client": client, "type": "telegram"}
+            "message": message, "client": client, "type": "telegram",
+            "media": message.reply_to_message}
         return await message.reply_text(
             picker[0], reply_markup=picker[1], quote=True)
 
