@@ -785,27 +785,29 @@ def _draw_spectrogram_canvas(plot, title, desc, sample_rate, duration, version):
             value += step
 
     # Time axis (bottom): a tick every 5 minutes, with the true end of the
-    # audio as the final label (a 2:43:00 track ends at "163:00"). The loop
-    # stops short of a tick that would collide with that end label, otherwise
-    # the last two labels are drawn on top of each other.
+    # audio as the final label (a 2 h 43 min track ends at "2:43:00"). The
+    # tick at the very end is never drawn twice, so the last two labels no
+    # longer land on top of each other.
     if duration and duration > 0:
         step = SPEK_TIME_STEP
         end_x = left + plot_w
         end_label = _format_time(duration)
         min_gap = draw.textlength(end_label, font=font_small)
+        # a tick whose label would overlap the end label keeps its grid line
+        # but drops the text; the loop also never draws a tick at the very end,
+        # which is where that end label goes
         value = 0.0
         while value <= duration + 1e-9:
             x = left + (value / duration) * plot_w
-            is_end = value >= duration - 1e-9
-            # skip a tick whose label would run into the end label
-            if is_end or (x != left and end_x - x < min_gap):
+            if value >= duration - 1e-9:
                 break
             draw.line([x, top + plot_h + 1, x, top + plot_h + 5],
                       fill=(255, 255, 255))
             label = _format_time(value)
             label_width = draw.textlength(label, font=font_small)
-            draw.text((x - label_width / 2, top + plot_h + 8), label,
-                      font=font_small, fill=(255, 255, 255))
+            if x == left or end_x - x >= min_gap:
+                draw.text((x - label_width / 2, top + plot_h + 8), label,
+                          font=font_small, fill=(255, 255, 255))
             value += step
 
         draw.line([end_x, top + plot_h + 1, end_x, top + plot_h + 5],
