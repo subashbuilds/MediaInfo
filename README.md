@@ -48,7 +48,7 @@ Simply send / forward any media file or paste a link in the chat — the bot rep
 |--------|--------------|
 | 🎬 **Mediainfo** | Detailed mediainfo → Telegraph page + summary in chat |
 | 📄 **Raw info** | Raw mediainfo text sent as a document |
-| 📸 **Screenshots** | Pick 1–60 screenshots → uploaded to slow.pics |
+| 📸 **Screenshots** | Pick 1–60 screenshots → uploaded to telegram |
 | 🎵 **Spectrogram** | One single-graph spek-style spectrogram per audio track, with bitrate |
 | ✂️ **Sample** | Pick 30 s / 60 s / custom → sample video from a random position |
 
@@ -102,8 +102,8 @@ sudo apt-get install -y fonts-dejavu-core  # fonts used to label the spek-style 
 clone the repository and install the requirements
 
 ```sh
-git clone https://github.com/sanjit-sinha/Tg-MediaInfoBot
-cd Tg-MediaInfoBot
+git clone https://github.com/subashbuilds/MediaInfo
+cd MediaInfo
 pip3 install -U -r requirements.txt
 ```
 
